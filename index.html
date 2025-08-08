@@ -135,15 +135,21 @@
     .player-income { font-variant-numeric: tabular-nums; opacity: 0.9; }
     .player-row .cols { display:flex; align-items:center; gap:12px; }
     .player-income small { opacity: 0.75; font-size: 12px; margin-left: 2px; }
+#toasts { position: absolute; bottom: 12px; right: 12px; z-index: 50; display: flex; flex-direction: column; gap: 8px; }
+.toast { background: rgba(0,0,0,0.75); color:#fff; padding:8px 12px; border-radius:8px; font-size:13px; pointer-events:none; animation: fadeout 3s forwards; }
+@keyframes fadeout { 0%{opacity:1; transform:translateY(0)} 80%{opacity:1} 100%{opacity:0; transform:translateY(10px)} }
+    .tiny-btn { margin-left: 6px; padding: 2px 6px; font-size: 11px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.4); background: rgba(255,255,255,0.12); color: #fff; cursor: pointer; }
+    .tiny-btn:hover { background: rgba(255,255,255,0.22); }
   </style>
 </head>
 <body>
   <div id="game">
     <div id="ui">
-      Gold: <span id="gold">500</span><br>
-      Army: <span id="army">0</span>
-      <br>Farms: <span id="farms">0</span>
-      <br>Income: <span id="income">10</span>/min
+      <div>Timer: <span id="timer">10:00</span></div>
+      <div>Gold: <span id="gold">500</span></div>
+      <div>Army: <span id="army">0</span></div>
+      <div>Farms: <span id="farms">0</span></div>
+      <div>Income: <span id="income">10</span>/min <button id="toggle-net" class="tiny-btn">NET</button></div>
     </div>
     <details id="sidebar" open>
       <summary>
@@ -158,6 +164,7 @@
       <div class="troop-btn" onclick="hire('cavalry', 100)">Hire Cavalry (100)</div>
       <div class="troop-btn" onclick="hire('militia', 30)">Hire Militia (30)</div>
     </div>
+    <div id="toasts"></div>
   </div>
 
   <div id="modal-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10;justify-content:center;align-items:center;">
@@ -172,11 +179,22 @@
     const playerColors = ['#ffd700', '#00bfff', '#ff4500', '#32cd32', '#ff69b4', '#ffa500', '#8a2be2', '#00ced1'];
     const castleElements = new Map(); // key -> DOM element for castle
 
+    // --- Auto-hiring (per minute) rates ---
+    const autoHireRatesPerMin = {
+      militia: 0.05,
+      infantry: 0.10,
+      archer: 0.10,
+      cavalry: 0.20,
+    };
+
     // Central Castle ownership model
-    let centerDefense = 1000;            // neutral defenders until captured
+    let centerDefenseMax = 1000;         // maximum neutral defenders
+    let centerDefense = centerDefenseMax; // current neutral defenders until captured
     let centralOwnerIndex = null;        // null => neutral
     let centralGarrison = 0;             // troops stationed if owned
     let centerElement = null;            // DOM element reference
+    // Track per-attacker reward progress for neutral guard damage (percentage thresholds)
+    const centerDamageProgress = new Map(); // attackerIndex -> last whole percent rewarded
 
     function updateCenterVisual() {
       if (!centerElement) return;
@@ -223,6 +241,11 @@
       army: 0,
     }));
 
+    // Ensure each player has per-type army buckets
+    players.forEach((p) => {
+      if (!p._armyByType) p._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
+    });
+
     // Castle garrisons: key -> { ownerIndex, troops }
     const castleGarrisons = new Map();
     positions.forEach(([x, y], i) => {
@@ -237,11 +260,109 @@
       return { attLeft, defLeft };
     }
 
+    // Reward helper: grant 100 gold for each whole percent of neutral guard destroyed
+    function grantCenterGuardReward(attackerIndex, beforeDef, afterDef) {
+      if (attackerIndex == null) return;
+      // Only while center is neutral (no owner)
+      if (centralOwnerIndex !== null) return;
+      const prevPct = Math.floor(((centerDefenseMax - beforeDef) / centerDefenseMax) * 100);
+      const newPct  = Math.floor(((centerDefenseMax - afterDef)  / centerDefenseMax) * 100);
+      if (newPct > prevPct) {
+        const steps = newPct - prevPct;
+        const reward = steps * 100;
+        const p = players[attackerIndex];
+        p.gold += reward;
+        if (attackerIndex === 0) {
+          gold = p.gold; // sync local cache/UI
+          goldText.textContent = Math.floor(gold);
+          showToast(`+${reward} gold (castle damage)`);
+          // Optional: show a small popup for the local player:
+          // createInfoPopup(`Bonus for castle damage: +${reward} gold`);
+        }
+      }
+      // Record latest awarded percent for this attacker
+      centerDamageProgress.set(attackerIndex, newPct);
+    }
+
     // Helper: count farms owned by a player
     function countFarmsOwned(ownerIndex) {
       let n = 0;
       farmOwners.forEach((rec) => { if (rec.ownerIndex === ownerIndex) n++; });
       return n;
+    }
+
+    // Estimate expected auto-hire spend per minute using per-type army structure
+    function estimateAutoHireCostPerMin(player) {
+      if (!player) return 0;
+      if (!player._armyByType) player._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
+      let spend = 0;
+      for (const [type, cost] of Object.entries(autoHireRatesPerMin)) {
+        const qty = player._armyByType[type] || 0;
+        spend += cost * qty;
+      }
+      // Part 1.2 — floor to integer for UI (always down)
+      return Math.floor(spend);
+    }
+
+    function fmtTime(s) {
+      s = Math.max(0, Math.floor(s));
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return `${m.toString().padStart(2,'0')}:${r.toString().padStart(2,'0')}`;
+    }
+
+    function endMatch() {
+      if (matchEnded) return;
+      matchEnded = true;
+      // winner by current gold
+      const winner = [...players].sort((a,b)=> b.gold - a.gold)[0];
+      const container = document.createElement('div');
+      container.innerHTML = `
+        <h3>Time's up!</h3>
+        <div style="margin:8px 0;">Winner: <strong>${winner.label}</strong> (${winner.gold} gold)</div>
+      `;
+      const btnContinue = document.createElement('button');
+      btnContinue.textContent = 'Continue';
+      btnContinue.onclick = () => { closeModal(); matchTimeLeft = 600; matchEnded = false; };
+      const btnNew = document.createElement('button');
+      btnNew.textContent = 'New Game';
+      btnNew.style.marginLeft = '10px';
+      btnNew.onclick = () => { closeModal(); newGame(); };
+      container.append(btnContinue, btnNew);
+      showModal(container);
+    }
+
+    function newGame() {
+      // reset players
+      players.forEach((p) => { p.gold = 500; p.army = 0; p._goldAcc = 0; });
+      gold = players[0].gold; army = players[0].army;
+      goldText.textContent = Math.floor(gold); armyText.textContent = army;
+
+      // reset farms
+      farmOwners.clear();
+      farmElements.forEach((_, key) => updateFarmVisual(key));
+      capturedFarms.clear();
+      const lf = countFarmsOwned(0);
+      farmsText.textContent = lf;
+      incomeText.textContent = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+
+      // reset central castle
+      centerDefense = centerDefenseMax;
+      centralOwnerIndex = null;
+      centralGarrison = 0;
+      centerDamageProgress.clear();
+      updateCenterVisual();
+
+      // sync castles
+      for (let i = 0; i < players.length; i++) syncCastleGarrison(i);
+      positions.forEach(([x, y]) => updateCastleVisual(`${x},${y}`));
+
+      // reset timer
+      matchTimeLeft = 600;
+      matchEnded = false;
+
+      // refresh sidebar
+      renderPlayerSidebar();
     }
 
     // Helper: send surviving attackers back to their home castle and add to available army (not garrison)
@@ -252,6 +373,9 @@
         onArrival: () => {
           // Add survivors to the player's available army pool
           players[ownerIndex].army = (players[ownerIndex].army || 0) + survivors;
+          // PART 1.3.5: Attribute survivors to militia bucket
+          ensureArmyBuckets(players[ownerIndex]);
+          players[ownerIndex]._armyByType.militia += survivors;
           if (ownerIndex === 0) {
             army += survivors;
             armyText.textContent = army;
@@ -270,9 +394,47 @@
       updateCastleVisual(ckey);
     }
 
+    // Auto-hire one unit per type if player has enough gold for that type (costs are per minute)
+    function autoHireArmy(player) {
+      if (!player) return;
+      if (!player._armyByType) player._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
+      let _spent = 0;
+      const _added = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
+      for (const [type, cost] of Object.entries(autoHireRatesPerMin)) {
+        if (player.gold >= cost) {
+          player.gold -= cost;
+          player._armyByType[type] += 1;
+          player.army = (player.army || 0) + 1;
+          syncCastleGarrison(player.index);
+          _spent += cost;
+          _added[type] += 1;
+          // Update local UI if it's the human player
+          if (player.index === 0) {
+            gold = player.gold;
+            goldText.textContent = Math.floor(gold);
+            army = player.army;
+            armyText.textContent = army;
+            syncCastleGarrison(0);
+          }
+        }
+      }
+      // Show summary toast for local player if anything was hired
+      if (player.index === 0 && _spent > 0) {
+        const parts = [];
+        for (const t of Object.keys(_added)) {
+          if (_added[t] > 0) parts.push(`+${_added[t]} ${t}`);
+        }
+        if (parts.length) showToast(`Auto-hire: ${parts.join(', ')} (-${_spent.toFixed(2)} gold)`);
+      }
+    }
+
+    // --- Income toggle ---
+    let _showNet = true; // NET by default; toggle switches between NET and GROSS
+
     // Continuous per-second income with integer gold increases
     players.forEach(p => p._goldAcc = 0);
     let _lastTs = performance.now();
+    let _autoHireAcc = 0; // seconds accumulator for auto-hiring per minute
     function mainLoop(ts) {
       const dt = Math.max(0, (ts - _lastTs) / 1000);
       _lastTs = ts;
@@ -289,14 +451,34 @@
           p.gold += whole;
           if (p.index === 0) {
             gold = p.gold;
-            goldText.textContent = gold;
+            goldText.textContent = Math.floor(gold);
           }
         }
         if (p.index === 0) {
           farmsText.textContent = farmsOwned;
-          incomeText.textContent = 30 + farmsOwned * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+          const gross = 30 + farmsOwned * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+          const expense = estimateAutoHireCostPerMin(players[0]);
+          const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
+          incomeText.textContent = incomeVal;
         }
       });
+      // Auto-hiring update (run once per minute, catch up if tab was inactive)
+      _autoHireAcc += dt;
+      if (_autoHireAcc >= 60) {
+        const ticks = Math.floor(_autoHireAcc / 60);
+        _autoHireAcc -= ticks * 60;
+        for (let i = 0; i < ticks; i++) {
+          players.forEach((p) => autoHireArmy(p));
+        }
+      }
+      // Match timer update
+      if (!matchEnded) {
+        matchTimeLeft -= dt;
+        if (timerEl) timerEl.textContent = fmtTime(matchTimeLeft);
+        if (matchTimeLeft <= 0) {
+          endMatch();
+        }
+      }
       // Throttled sidebar refresh (~2 times/sec)
       mainLoop._acc = (mainLoop._acc || 0) + dt;
       if (mainLoop._acc >= 0.5) { renderPlayerSidebar(); mainLoop._acc = 0; }
@@ -308,6 +490,24 @@
     const armyText = document.getElementById("army");
     const farmsText = document.getElementById("farms");
     const incomeText = document.getElementById("income");
+    const timerEl = document.getElementById('timer');
+    const toggleNetBtn = document.getElementById('toggle-net');
+    if (toggleNetBtn) {
+      toggleNetBtn.onclick = () => {
+        _showNet = !_showNet;
+        toggleNetBtn.textContent = _showNet ? 'NET' : 'GROSS';
+        // Refresh HUD income immediately
+        const farmsOwned = countFarmsOwned(0);
+        const gross = 30 + farmsOwned * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+        const expense = estimateAutoHireCostPerMin(players[0]);
+        const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
+        incomeText.textContent = incomeVal;
+        // Refresh sidebar
+        renderPlayerSidebar();
+      };
+    }
+    let matchTimeLeft = 600; // 10 minutes
+    let matchEnded = false;
     let gold = 500;
     let army = 0;
 
@@ -330,7 +530,7 @@
     function renderPlayerSidebar() {
       if (!playerListEl) return;
       const frag = document.createDocumentFragment();
-      players.forEach((p) => {
+      [...players].sort((a,b)=> b.gold - a.gold).forEach((p) => {
         const row = document.createElement('div');
         row.className = 'player-row';
 
@@ -344,18 +544,23 @@
         name.textContent = p.label;
         meta.append(dot, name);
 
-        // middle: live income per minute
+        // middle: live income per minute (net: gross income minus auto-hire estimate)
         const farmsOwned = countFarmsOwned(p.index);
         const hasCenter = (centralOwnerIndex === p.index) ? 200 : 0;
-        const incomePerMin = 30 + farmsOwned * 10 + hasCenter;
+        const gross = 30 + farmsOwned * 10 + hasCenter;
+        const expense = estimateAutoHireCostPerMin(p);
+        const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
         const incomeEl = document.createElement('div');
         incomeEl.className = 'player-income';
-        incomeEl.innerHTML = `${incomePerMin}<small>/min</small>`;
+        incomeEl.innerHTML = `${incomeVal}<small>/min</small>`;
+        incomeEl.title = _showNet
+          ? `Income: ${Math.floor(gross)}/min\nAuto-hire: -${Math.floor(expense)}/min\nNet: ${incomeVal}/min`
+          : `Gross income: ${Math.floor(gross)}/min`;
 
         // right: current gold
         const goldEl = document.createElement('div');
         goldEl.className = 'player-gold';
-        goldEl.textContent = `${p.gold}`;
+        goldEl.textContent = `${Math.floor(p.gold)}`;
 
         const cols = document.createElement('div');
         cols.className = 'cols';
@@ -425,6 +630,16 @@
       showModal(container);
     }
 
+    function showToast(message) {
+      const c = document.getElementById('toasts');
+      if (!c) return;
+      const el = document.createElement('div');
+      el.className = 'toast';
+      el.textContent = message;
+      c.appendChild(el);
+      setTimeout(() => { if (el.parentNode === c) c.removeChild(el); }, 3000);
+    }
+
     function createTroopPopup(troopTypes, maxAmounts, callback) {
       const container = document.createElement("div");
       container.innerHTML = "<h3>Select Troops</h3>";
@@ -467,6 +682,21 @@
       cancel.onclick = closeModal;
       container.append(ok, cancel);
       showModal(container);
+    }
+
+    // === Per-type army helpers (1.3.1) ===
+    function ensureArmyBuckets(p) {
+      if (!p._armyByType) p._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
+      return p._armyByType;
+    }
+
+    function deductArmyByType(playerIndex, selected) {
+      const p = players[playerIndex];
+      const buckets = ensureArmyBuckets(p);
+      for (const k of Object.keys(buckets)) {
+        const want = selected[k] || 0;
+        buckets[k] = Math.max(0, (buckets[k] || 0) - want);
+      }
     }
 
     function sendTroops(fromX, fromY, toX, toY, durationSeconds = null, options = {}) {
@@ -571,7 +801,7 @@
         const total = count * cost;
         gold -= total; players[0].gold = gold;
         army += count; players[0].army = army;
-        goldText.textContent = gold;
+        goldText.textContent = Math.floor(gold);
         armyText.textContent = army;
         syncCastleGarrison(0);
         createInfoPopup(`Hired ${count} ${type}(s)!`);
@@ -606,12 +836,17 @@
     let localPlayerPos = { x: positions[0][0], y: positions[0][1] };
 
     // Center castle — capturable; owner gets +200/min
-    centerElement = addObject("center", 50, 50, "Central Castle — Guard: 1000", () => {
+centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + centerDefenseMax, () => {
       if (army > 0) {
+        const b = ensureArmyBuckets(players[0]);
         createTroopPopup(["infantry", "archer", "cavalry", "militia"], {
-          infantry: army, archer: army, cavalry: army, militia: army
+          infantry: b.infantry || 0,
+          archer: b.archer || 0,
+          cavalry: b.cavalry || 0,
+          militia: b.militia || 0
         }, (selectedTroops, totalSent) => {
           army -= totalSent; players[0].army = army; armyText.textContent = army;
+          deductArmyByType(0, selectedTroops);
           syncCastleGarrison(0);
           const time = Math.floor(Math.random() * 5) + 3;
           sendTroops(localPlayerPos.x, localPlayerPos.y, 50, 50, time, {
@@ -619,9 +854,11 @@
             payload: { sent: totalSent, attackerIndex: 0 },
             onArrival: (p) => {
               if (centralOwnerIndex === null) {
-                // fight neutral defenders
-                const { attLeft, defLeft } = resolveBattle(p.sent, centerDefense);
+                // fight neutral defenders and grant per-1% rewards
+                const before = centerDefense;
+                const { attLeft, defLeft } = resolveBattle(p.sent, before);
                 centerDefense = defLeft;
+                grantCenterGuardReward(p.attackerIndex, before, centerDefense);
                 if (attLeft > 0 && defLeft === 0) {
                   centralOwnerIndex = p.attackerIndex;
                   centralGarrison = attLeft; // survivors stay as central garrison
@@ -659,10 +896,15 @@
         } else {
           // Attack enemy castle
           if (army > 0) {
+            const b = ensureArmyBuckets(players[0]);
             createTroopPopup(["infantry", "archer", "cavalry", "militia"], {
-              infantry: army, archer: army, cavalry: army, militia: army
+              infantry: b.infantry || 0,
+              archer: b.archer || 0,
+              cavalry: b.cavalry || 0,
+              militia: b.militia || 0
             }, (selectedTroops, totalSent) => {
               army -= totalSent; players[0].army = army; armyText.textContent = army;
+              deductArmyByType(0, selectedTroops);
               syncCastleGarrison(0);
               const time = Math.floor(Math.random() * 5) + 3;
               const key = `${x},${y}`;
@@ -678,7 +920,8 @@
                     const victim = players[p.defenderIndex];
                     const stealMax = Math.floor(victim.gold * 0.10);
                     const loot = Math.min(stealMax, 150);
-                    victim.gold -= loot; players[0].gold += loot; gold = players[0].gold; goldText.textContent = gold;
+                    victim.gold -= loot; players[0].gold += loot; gold = players[0].gold; goldText.textContent = Math.floor(gold);
+                    showToast(`Looted +${loot} gold`);
                     createInfoPopup(`Raid successful! Looted ${loot} gold from ${victim.label}.`);
                     // send survivors back to our castle with visible movement
                     sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, p.attackerIndex);
@@ -736,27 +979,35 @@
             farmOwners.set(key, owner);
             updateFarmVisual(key);
             const time = Math.floor(Math.random() * 5) + 3;
-            sendTroops(x, y, localPlayerPos.x, localPlayerPos.y, time, {
-              ownerIndex: 0,
-              onArrival: () => {
-                // Move recalled troops into available army and sync castle UI
-                players[0].army = (players[0].army || 0) + count;
-                army += count;
-                armyText.textContent = army;
-                syncCastleGarrison(0);
-              }
-            });
+                sendTroops(x, y, localPlayerPos.x, localPlayerPos.y, time, {
+                  ownerIndex: 0,
+                  onArrival: () => {
+                    // Move recalled troops into available army and sync castle UI
+                    players[0].army = (players[0].army || 0) + count;
+                    ensureArmyBuckets(players[0]);
+                    players[0]._armyByType.militia += count;
+                    army += count;
+                    armyText.textContent = army;
+                    syncCastleGarrison(0);
+                    showToast(`Recalled +${count} troops`);
+                  }
+                });
           });
           return;
         }
         // Otherwise behave as attack/send as before
         if (army > 0) {
+          const b = ensureArmyBuckets(players[0]);
           createTroopPopup(['infantry', 'archer', 'cavalry', 'militia'], {
-            infantry: army, archer: army, cavalry: army, militia: army
+            infantry: b.infantry || 0,
+            archer: b.archer || 0,
+            cavalry: b.cavalry || 0,
+            militia: b.militia || 0
           }, (selectedTroops, totalSent) => {
             army -= totalSent;
             armyText.textContent = army;
             players[0].army = army;
+            deductArmyByType(0, selectedTroops);
             syncCastleGarrison(0);
             const time = Math.floor(Math.random() * 5) + 3;
             const ownerIndex = 0; // local player
@@ -782,7 +1033,12 @@
                 updateFarmVisual(p.key);
                 const lf = countFarmsOwned(0);
                 farmsText.textContent = lf;
-                incomeText.textContent = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+                {
+                  const gross = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+                  const expense = estimateAutoHireCostPerMin(players[0]);
+                  const net = Math.max(0, Math.floor(gross - expense));
+                  incomeText.textContent = net;
+                }
               }
             });
             createInfoPopup(`Sending troops to farm. Arrival in ${time} seconds.`);
@@ -804,10 +1060,18 @@
         const toBuy = Math.min(canBuy, 5 + Math.floor(Math.random() * 10));
         ai.gold -= toBuy * cost;
         ai.army += toBuy;
+        // PART 1.3.6: Attribute hired militia to militia bucket
+        ensureArmyBuckets(ai);
+        ai._armyByType.militia += toBuy;
       }
       if (ai.army === 0) return;
       const send = Math.max(1, Math.floor(ai.army * (0.2 + Math.random() * 0.5)));
       ai.army -= send;
+      // PART 1.3.6: Deduct sent units from AI's militia bucket
+      if (ai._armyByType) {
+        const take = Math.min(send, ai._armyByType.militia || 0);
+        ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+      }
       syncCastleGarrison(ai.index);
       const r = Math.random();
       if (r < 0.20) {
@@ -817,8 +1081,10 @@
           payload: { sent: send, attackerIndex: ai.index },
           onArrival: (p) => {
             if (centralOwnerIndex === null) {
-              const { attLeft, defLeft } = resolveBattle(p.sent, centerDefense);
+              const before = centerDefense;
+              const { attLeft, defLeft } = resolveBattle(p.sent, before);
               centerDefense = defLeft;
+              grantCenterGuardReward(p.attackerIndex, before, centerDefense);
               if (attLeft > 0 && defLeft === 0) {
                 centralOwnerIndex = p.attackerIndex;
                 centralGarrison = attLeft;
@@ -887,7 +1153,12 @@
             players[ai.index] = ai;
             const lf = countFarmsOwned(0);
             farmsText.textContent = lf;
-            incomeText.textContent = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+            {
+              const gross = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+              const expense = estimateAutoHireCostPerMin(players[0]);
+              const net = Math.max(0, Math.floor(gross - expense));
+              incomeText.textContent = net;
+            }
           }
         });
       }
