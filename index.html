@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Castle War Prototype</title>
+  <style>
+    body {
+      margin: 0;
+      background: #ade16a;
+      font-family: sans-serif;
+      overflow: hidden;
+    }
+    #game {
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+      background: url("bg.jpg") center/cover no-repeat;
+    }
+    .object {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      cursor: pointer;
+      text-align: center;
+    }
+    .object span {
+      display: block;
+      font-size: 10px;
+      margin-top: 2px;
+      color: white;
+      text-shadow: 1px 1px 2px black;
+    }
+    .castle {
+      width: 64px;
+    }
+    .mine {
+      width: 48px;
+    }
+    .center {
+      width: 72px;
+    }
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.6);
+      color: #fff;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    #troop-panel {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: rgba(0,0,0,0.7);
+      padding: 10px;
+      color: #fff;
+      font-size: 14px;
+      display: flex;
+      justify-content: space-around;
+    }
+    .troop-btn {
+      background: #3a8;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .local-player {
+      border: 2px solid yellow;
+      box-shadow: 0 0 10px yellow;
+    }
+    .army-icon {
+      width: 24px;
+      position: absolute;
+      transition: all linear;
+    }
+    .mine.owned {
+      /* visual marker for owned farms; color set inline via style */
+      outline: 2px solid;
+      outline-offset: 2px;
+    }
+    .castle.owned {
+      outline: 2px solid;
+      outline-offset: 2px;
+    }
+    .center.owned {
+      outline: 2px solid;
+      outline-offset: 2px;
+    }
+    .army-icon.bubble {
+      border: 2px solid;
+      border-radius: 50%;
+      box-shadow: 0 0 8px rgba(0,0,0,0.4);
+      background: rgba(255,255,255,0.2);
+    }
+    .army-glyph {
+      width: 14px;
+      height: 14px;
+      vertical-align: -2px;
+      margin-right: 3px;
+      image-rendering: pixelated;
+    }
+    #sidebar {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 20;
+      width: 240px;
+      background: rgba(0,0,0,0.6);
+      color: #fff;
+      border-radius: 8px;
+      overflow: hidden;
+      font-size: 14px;
+    }
+    #sidebar summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 10px 12px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(0,0,0,0.7);
+    }
+    #sidebar[open] summary {
+      border-bottom: 1px solid rgba(255,255,255,0.15);
+    }
+    .player-list { padding: 8px 10px; max-height: 40vh; overflow: auto; }
+    .player-row { display:flex; align-items:center; justify-content:space-between; padding:6px 4px; }
+    .player-meta { display:flex; align-items:center; gap:8px; }
+    .player-dot { width:10px; height:10px; border-radius:50%; outline:1px solid rgba(0,0,0,0.4); }
+    .player-gold { font-variant-numeric: tabular-nums; }
+    .player-income { font-variant-numeric: tabular-nums; opacity: 0.9; }
+    .player-row .cols { display:flex; align-items:center; gap:12px; }
+    .player-income small { opacity: 0.75; font-size: 12px; margin-left: 2px; }
+  </style>
+</head>
+<body>
+  <div id="game">
+    <div id="ui">
+      Gold: <span id="gold">500</span><br>
+      Army: <span id="army">0</span>
+      <br>Farms: <span id="farms">0</span>
+      <br>Income: <span id="income">10</span>/min
+    </div>
+    <details id="sidebar" open>
+      <summary>
+        Players & Gold
+        <span style="opacity:.8;font-size:12px">(click to toggle)</span>
+      </summary>
+      <div class="player-list" id="player-list"></div>
+    </details>
+    <div id="troop-panel">
+      <div class="troop-btn" onclick="hire('infantry', 50)">Hire Infantry (50)</div>
+      <div class="troop-btn" onclick="hire('archer', 70)">Hire Archer (70)</div>
+      <div class="troop-btn" onclick="hire('cavalry', 100)">Hire Cavalry (100)</div>
+      <div class="troop-btn" onclick="hire('militia', 30)">Hire Militia (30)</div>
+    </div>
+  </div>
+
+  <div id="modal-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10;justify-content:center;align-items:center;">
+    <div id="modal" style="background:white;padding:20px;border-radius:10px;min-width:200px;text-align:center;"></div>
+  </div>
+
+  <script>
+    const farmsMap = new Map();
+    const capturedFarms = new Set();
+    const farmOwners = new Map(); // key -> { ownerIndex, ownerLabel, troops }
+    const farmElements = new Map(); // key -> DOM element for the farm
+    const playerColors = ['#ffd700', '#00bfff', '#ff4500', '#32cd32', '#ff69b4', '#ffa500', '#8a2be2', '#00ced1'];
+    const castleElements = new Map(); // key -> DOM element for castle
+
+    // Central Castle ownership model
+    let centerDefense = 1000;            // neutral defenders until captured
+    let centralOwnerIndex = null;        // null => neutral
+    let centralGarrison = 0;             // troops stationed if owned
+    let centerElement = null;            // DOM element reference
+
+    function updateCenterVisual() {
+      if (!centerElement) return;
+      const span = centerElement.querySelector('span');
+      if (centralOwnerIndex === null) {
+        if (span) span.innerHTML = `Central Castle — Guard: <img src="army-icon.png" class="army-glyph">${centerDefense}`;
+        centerElement.classList.remove('owned');
+        centerElement.style.outlineColor = '';
+      } else {
+        const color = playerColors[centralOwnerIndex % playerColors.length] || '#fff';
+        centerElement.classList.add('owned');
+        centerElement.style.outlineColor = color;
+        if (span) span.innerHTML = `Central Castle — Owner: Player ${centralOwnerIndex + 1} — Garrison: <img src="army-icon.png" class="army-glyph">${centralGarrison}`;
+      }
+    }
+
+    function updateFarmVisual(key) {
+      const el = farmElements.get(key);
+      if (!el) return;
+      const span = el.querySelector('span');
+      const rec = farmOwners.get(key);
+      if (rec) {
+        if (span) span.innerHTML = `Farm — ${rec.ownerLabel}: <img src="army-icon.png" class="army-glyph">${rec.troops}`;
+        el.classList.add('owned');
+        const color = playerColors[rec.ownerIndex % playerColors.length] || '#fff';
+        el.style.outlineColor = color;
+      } else {
+        if (span) span.textContent = 'Farm';
+        el.classList.remove('owned');
+        el.style.outlineColor = '';
+      }
+    }
+
+    // --- Players / Ownership model ---
+    const positions = [
+      [20, 10], [50, 10], [80, 20], [90, 50],
+      [80, 80], [50, 90], [20, 80], [10, 50],
+    ];
+    const players = positions.map(([x, y], i) => ({
+      index: i,
+      label: `Player ${i + 1}`,
+      x, y,
+      gold: 500,
+      army: 0,
+    }));
+
+    // Castle garrisons: key -> { ownerIndex, troops }
+    const castleGarrisons = new Map();
+    positions.forEach(([x, y], i) => {
+      const key = `${x},${y}`;
+      castleGarrisons.set(key, { ownerIndex: i, troops: 0 });
+    });
+
+    // Helper: resolve simple 1:1 attrition battle
+    function resolveBattle(attacker, defender) {
+      const attLeft = Math.max(0, attacker - defender);
+      const defLeft = Math.max(0, defender - attacker);
+      return { attLeft, defLeft };
+    }
+
+    // Helper: count farms owned by a player
+    function countFarmsOwned(ownerIndex) {
+      let n = 0;
+      farmOwners.forEach((rec) => { if (rec.ownerIndex === ownerIndex) n++; });
+      return n;
+    }
+
+    // Helper: send surviving attackers back to their home castle and add to available army (not garrison)
+    function sendBackSurvivors(fromX, fromY, toX, toY, survivors, ownerIndex) {
+      if (!survivors || survivors <= 0) return;
+      sendTroops(fromX, fromY, toX, toY, null, {
+        ownerIndex,
+        onArrival: () => {
+          // Add survivors to the player's available army pool
+          players[ownerIndex].army = (players[ownerIndex].army || 0) + survivors;
+          if (ownerIndex === 0) {
+            army += survivors;
+            armyText.textContent = army;
+          }
+          syncCastleGarrison(ownerIndex);
+        }
+      });
+    }
+
+    // Keep each player's castle garrison equal to their available army
+    function syncCastleGarrison(playerIndex) {
+      const [cx, cy] = positions[playerIndex];
+      const ckey = `${cx},${cy}`;
+      const rec = { ownerIndex: playerIndex, troops: players[playerIndex].army || 0 };
+      castleGarrisons.set(ckey, rec);
+      updateCastleVisual(ckey);
+    }
+
+    // Continuous per-second income with integer gold increases
+    players.forEach(p => p._goldAcc = 0);
+    let _lastTs = performance.now();
+    function mainLoop(ts) {
+      const dt = Math.max(0, (ts - _lastTs) / 1000);
+      _lastTs = ts;
+      // per-player income accumulation
+      players.forEach((p) => {
+        const farmsOwned = countFarmsOwned(p.index);
+        const hasCenter = (centralOwnerIndex === p.index) ? 200 : 0;
+        const incomePerMin = 30 + farmsOwned * 10 + hasCenter; // +200 if owns center
+        const incomePerSec = incomePerMin / 60;
+        p._goldAcc += incomePerSec * dt;
+        if (p._goldAcc >= 1) {
+          const whole = Math.floor(p._goldAcc);
+          p._goldAcc -= whole;
+          p.gold += whole;
+          if (p.index === 0) {
+            gold = p.gold;
+            goldText.textContent = gold;
+          }
+        }
+        if (p.index === 0) {
+          farmsText.textContent = farmsOwned;
+          incomeText.textContent = 30 + farmsOwned * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+        }
+      });
+      // Throttled sidebar refresh (~2 times/sec)
+      mainLoop._acc = (mainLoop._acc || 0) + dt;
+      if (mainLoop._acc >= 0.5) { renderPlayerSidebar(); mainLoop._acc = 0; }
+      requestAnimationFrame(mainLoop);
+    }
+    requestAnimationFrame(mainLoop);
+    const game = document.getElementById("game");
+    const goldText = document.getElementById("gold");
+    const armyText = document.getElementById("army");
+    const farmsText = document.getElementById("farms");
+    const incomeText = document.getElementById("income");
+    let gold = 500;
+    let army = 0;
+
+    // Sidebar DOM refs and render
+    const playerListEl = document.getElementById('player-list');
+
+    function getTotalTroops(ownerIndex) {
+      let total = 0;
+      // idle troops (purchased but not sent)
+      total += players[ownerIndex].army || 0;
+      // castle garrison
+      const ckey = `${positions[ownerIndex][0]},${positions[ownerIndex][1]}`;
+      const cg = castleGarrisons.get(ckey);
+      if (cg && cg.ownerIndex === ownerIndex) total += cg.troops;
+      // farms
+      farmOwners.forEach((rec) => { if (rec.ownerIndex === ownerIndex) total += rec.troops; });
+      return total;
+    }
+
+    function renderPlayerSidebar() {
+      if (!playerListEl) return;
+      const frag = document.createDocumentFragment();
+      players.forEach((p) => {
+        const row = document.createElement('div');
+        row.className = 'player-row';
+
+        // left: color dot + name
+        const meta = document.createElement('div');
+        meta.className = 'player-meta';
+        const dot = document.createElement('div');
+        dot.className = 'player-dot';
+        dot.style.background = playerColors[p.index % playerColors.length] || '#fff';
+        const name = document.createElement('div');
+        name.textContent = p.label;
+        meta.append(dot, name);
+
+        // middle: live income per minute
+        const farmsOwned = countFarmsOwned(p.index);
+        const hasCenter = (centralOwnerIndex === p.index) ? 200 : 0;
+        const incomePerMin = 30 + farmsOwned * 10 + hasCenter;
+        const incomeEl = document.createElement('div');
+        incomeEl.className = 'player-income';
+        incomeEl.innerHTML = `${incomePerMin}<small>/min</small>`;
+
+        // right: current gold
+        const goldEl = document.createElement('div');
+        goldEl.className = 'player-gold';
+        goldEl.textContent = `${p.gold}`;
+
+        const cols = document.createElement('div');
+        cols.className = 'cols';
+        cols.append(incomeEl, goldEl);
+
+        row.append(meta, cols);
+        frag.appendChild(row);
+      });
+      playerListEl.innerHTML = '';
+      playerListEl.appendChild(frag);
+    }
+
+    function showModal(content) {
+      const modal = document.getElementById("modal");
+      modal.innerHTML = '';
+      modal.appendChild(content);
+      document.getElementById("modal-overlay").style.display = "flex";
+    }
+
+    function closeModal() {
+      document.getElementById("modal-overlay").style.display = "none";
+    }
+
+    function createInputPopup(title, maxAmount, callback) {
+      const container = document.createElement("div");
+      const titleElem = document.createElement("div");
+      titleElem.textContent = title;
+      titleElem.style.marginBottom = "10px";
+      const input = document.createElement("input");
+      input.type = "number";
+      input.value = "1";
+      input.min = "1";
+      input.max = maxAmount;
+      input.style.width = "100%";
+      input.style.marginBottom = "10px";
+
+      const ok = document.createElement("button");
+      ok.textContent = "OK";
+      const cancel = document.createElement("button");
+      cancel.textContent = "Cancel";
+      cancel.style.marginLeft = "10px";
+
+      function validate() {
+        ok.disabled = parseInt(input.value) > maxAmount || parseInt(input.value) < 1;
+      }
+
+      input.oninput = validate;
+      validate();
+
+      ok.onclick = () => {
+        callback(parseInt(input.value));
+        closeModal();
+      };
+      cancel.onclick = closeModal;
+
+      container.append(titleElem, input, ok, cancel);
+      showModal(container);
+    }
+
+    function createInfoPopup(message) {
+      const container = document.createElement("div");
+      container.innerHTML = `<div style='margin-bottom:10px;'>${message}</div>`;
+      const btn = document.createElement("button");
+      btn.textContent = "OK";
+      btn.onclick = closeModal;
+      container.appendChild(btn);
+      showModal(container);
+    }
+
+    function createTroopPopup(troopTypes, maxAmounts, callback) {
+      const container = document.createElement("div");
+      container.innerHTML = "<h3>Select Troops</h3>";
+      const troopInputs = {};
+
+      troopTypes.forEach((type) => {
+        const div = document.createElement("div");
+        div.textContent = `${type}: `;
+        const input = document.createElement("input");
+        input.type = "number";
+        input.value = "0";
+        input.min = "0";
+        input.max = maxAmounts[type];
+        input.style.marginLeft = "5px";
+        div.appendChild(input);
+        container.appendChild(div);
+        troopInputs[type] = input;
+      });
+
+      const ok = document.createElement("button");
+      ok.textContent = "OK";
+      const cancel = document.createElement("button");
+      cancel.textContent = "Cancel";
+      cancel.style.marginLeft = "10px";
+
+      ok.onclick = () => {
+        const selected = {};
+        let totalSelected = 0;
+        Object.keys(troopInputs).forEach((type) => {
+          const amount = parseInt(troopInputs[type].value);
+          if (amount > 0) {
+            selected[type] = amount;
+            totalSelected += amount;
+          }
+        });
+        callback(selected, totalSelected);
+        closeModal();
+      };
+
+      cancel.onclick = closeModal;
+      container.append(ok, cancel);
+      showModal(container);
+    }
+
+    function sendTroops(fromX, fromY, toX, toY, durationSeconds = null, options = {}) {
+      const { onArrival = null, payload = null, ownerIndex = 0 } = options;
+      const isLocalPlayer = fromX === localPlayerPos.x && fromY === localPlayerPos.y;
+
+      const dx = toX - fromX;
+      const dy = toY - fromY;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const fullDistance = Math.sqrt(100 * 100 + 100 * 100);
+      const travelDuration = durationSeconds ?? (distance / fullDistance) * 60; // seconds
+      const travelMillis = travelDuration * 1000;
+
+      // Visual icon for everyone
+      const icon = document.createElement('img');
+      icon.src = 'army-icon.png';
+      icon.className = 'army-icon bubble';
+      icon.style.left = `${fromX}%`;
+      icon.style.top = `${fromY}%`;
+      const color = playerColors[ownerIndex % playerColors.length] || '#fff';
+      icon.style.borderColor = color;
+      game.appendChild(icon);
+
+      // Draw movement line only for local player
+      let line = null;
+      if (isLocalPlayer) {
+        line = document.createElement('div');
+        line.style.position = 'absolute';
+        line.style.left = '0';
+        line.style.top = '0';
+        line.style.width = '100%';
+        line.style.height = '100%';
+        line.style.pointerEvents = 'none';
+        const svgNS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('width', '100%');
+        svg.setAttribute('height', '100%');
+        svg.style.position = 'absolute';
+        svg.style.left = '0';
+        svg.style.top = '0';
+        const linePath = document.createElementNS(svgNS, 'line');
+        linePath.setAttribute('x1', `${fromX}%`);
+        linePath.setAttribute('y1', `${fromY}%`);
+        linePath.setAttribute('x2', `${toX}%`);
+        linePath.setAttribute('y2', `${toY}%`);
+        linePath.setAttribute('stroke', color);
+        linePath.setAttribute('stroke-width', '2');
+        svg.appendChild(linePath);
+        line.appendChild(svg);
+        game.appendChild(line);
+      }
+
+      const startTime = performance.now();
+      function animate(time) {
+        const elapsed = time - startTime;
+        const progress = Math.min(elapsed / travelMillis, 1);
+        const currentX = fromX + dx * progress;
+        const currentY = fromY + dy * progress;
+        icon.style.left = `${currentX}%`;
+        icon.style.top = `${currentY}%`;
+        if (progress < 1) {
+          requestAnimationFrame(animate);
+        } else {
+          if (icon.parentNode === game) game.removeChild(icon);
+          if (line && line.parentNode === game) game.removeChild(line);
+          if (typeof onArrival === 'function') {
+            onArrival(payload);
+          } else {
+            const key = `${Math.round(toX)},${Math.round(toY)}`;
+            if (farmsMap.has(key)) {
+              const rec = farmOwners.get(key) || { ownerIndex, ownerLabel: `Player ${ownerIndex + 1}`, troops: 0 };
+              farmOwners.set(key, rec);
+              updateFarmVisual(key);
+            }
+          }
+        }
+      }
+      requestAnimationFrame(animate);
+    }
+    function updateCastleVisual(key) {
+      const el = castleElements.get(key);
+      if (!el) return;
+      const span = el.querySelector('span');
+      // deduce owner index from key (each castle belongs to a fixed player by position)
+      const [x, y] = key.split(',').map(Number);
+      const ownerIndex = positions.findIndex(([px, py]) => px === x && py === y);
+      const color = playerColors[ownerIndex % playerColors.length] || '#fff';
+      el.classList.add('owned');
+      el.style.outlineColor = color;
+      const troops = players[ownerIndex] ? (players[ownerIndex].army || 0) : 0;
+      if (span) span.textContent = `Player ${ownerIndex + 1} — Garrison: ${troops}`;
+    }
+
+    function hire(type, cost) {
+      const maxBuy = Math.floor(gold / cost);
+      if (maxBuy < 1) {
+        createInfoPopup("Not enough gold!");
+        return;
+      }
+
+      createInputPopup(`How many ${type}s do you want to hire?`, maxBuy, (count) => {
+        const total = count * cost;
+        gold -= total; players[0].gold = gold;
+        army += count; players[0].army = army;
+        goldText.textContent = gold;
+        armyText.textContent = army;
+        syncCastleGarrison(0);
+        createInfoPopup(`Hired ${count} ${type}(s)!`);
+      });
+    }
+
+    function addObject(type, x, y, label, onClick) {
+      const div = document.createElement("div");
+      div.className = `object ${type}`;
+      div.style.left = `${x}%`;
+      div.style.top = `${y}%`;
+      div.dataset.x = x;
+      div.dataset.y = y;
+
+      const img = document.createElement("img");
+      img.src = type === "castle" ? "castle.png" : type === "center" ? "center_castle.png" : "mine.png";
+      img.style.width = type === "center" ? "72px" : type === "mine" ? "48px" : "64px";
+      div.appendChild(img);
+
+      if (label) {
+        const span = document.createElement("span");
+        span.textContent = label;
+        div.appendChild(span);
+      }
+
+      div.onclick = onClick;
+      game.appendChild(div);
+      return div;
+    }
+
+    // Set local player position from first castle (Player 1)
+    let localPlayerPos = { x: positions[0][0], y: positions[0][1] };
+
+    // Center castle — capturable; owner gets +200/min
+    centerElement = addObject("center", 50, 50, "Central Castle — Guard: 1000", () => {
+      if (army > 0) {
+        createTroopPopup(["infantry", "archer", "cavalry", "militia"], {
+          infantry: army, archer: army, cavalry: army, militia: army
+        }, (selectedTroops, totalSent) => {
+          army -= totalSent; players[0].army = army; armyText.textContent = army;
+          syncCastleGarrison(0);
+          const time = Math.floor(Math.random() * 5) + 3;
+          sendTroops(localPlayerPos.x, localPlayerPos.y, 50, 50, time, {
+            ownerIndex: 0,
+            payload: { sent: totalSent, attackerIndex: 0 },
+            onArrival: (p) => {
+              if (centralOwnerIndex === null) {
+                // fight neutral defenders
+                const { attLeft, defLeft } = resolveBattle(p.sent, centerDefense);
+                centerDefense = defLeft;
+                if (attLeft > 0 && defLeft === 0) {
+                  centralOwnerIndex = p.attackerIndex;
+                  centralGarrison = attLeft; // survivors stay as central garrison
+                }
+              } else if (centralOwnerIndex === p.attackerIndex) {
+                // reinforce own center
+                centralGarrison += p.sent;
+              } else {
+                // fight current owner's garrison
+                const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
+                if (attLeft > 0 && defLeft === 0) {
+                  centralOwnerIndex = p.attackerIndex;
+                  centralGarrison = attLeft;
+                } else {
+                  centralGarrison = defLeft;
+                }
+              }
+              updateCenterVisual();
+            }
+          });
+          createInfoPopup(`Marching to Central Castle. Arrival in ${time} seconds.`);
+        });
+      } else {
+        createInfoPopup("No troops available!");
+      }
+    });
+
+    positions.forEach(([x, y], index) => {
+      const isLocal = index === 0;
+      const label = `Player ${index + 1}`;
+      const onClick = () => {
+        if (isLocal) {
+          const garrisonNow = players[0].army || 0;
+          createInfoPopup(`Your castle garrison: ${garrisonNow}`);
+        } else {
+          // Attack enemy castle
+          if (army > 0) {
+            createTroopPopup(["infantry", "archer", "cavalry", "militia"], {
+              infantry: army, archer: army, cavalry: army, militia: army
+            }, (selectedTroops, totalSent) => {
+              army -= totalSent; players[0].army = army; armyText.textContent = army;
+              syncCastleGarrison(0);
+              const time = Math.floor(Math.random() * 5) + 3;
+              const key = `${x},${y}`;
+              sendTroops(localPlayerPos.x, localPlayerPos.y, x, y, time, {
+                ownerIndex: 0,
+                payload: { key, defenderIndex: index, sent: totalSent, attackerIndex: 0, originX: localPlayerPos.x, originY: localPlayerPos.y, targetX: x, targetY: y },
+                onArrival: (p) => {
+                  const defenderArmy = players[p.defenderIndex].army || 0;
+                  const { attLeft, defLeft } = resolveBattle(p.sent, defenderArmy);
+                  players[p.defenderIndex].army = defLeft;
+                  syncCastleGarrison(p.defenderIndex);
+                  if (attLeft > 0 && defLeft === 0) {
+                    const victim = players[p.defenderIndex];
+                    const stealMax = Math.floor(victim.gold * 0.10);
+                    const loot = Math.min(stealMax, 150);
+                    victim.gold -= loot; players[0].gold += loot; gold = players[0].gold; goldText.textContent = gold;
+                    createInfoPopup(`Raid successful! Looted ${loot} gold from ${victim.label}.`);
+                    // send survivors back to our castle with visible movement
+                    sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, p.attackerIndex);
+                  } else if (defLeft > 0) {
+                    createInfoPopup(`Raid repelled! Defender left: ${defLeft}.`);
+                  } else {
+                    createInfoPopup(`Both forces annihilated.`);
+                  }
+                }
+              });
+              createInfoPopup(`Attacking ${label}. Arrival in ${time} seconds.`);
+            });
+          } else {
+            createInfoPopup("No troops available!");
+          }
+        }
+      };
+      const div = addObject("castle", x, y, label, onClick);
+      const ckey = `${x},${y}`;
+      castleElements.set(ckey, div);
+      const color = playerColors[index % playerColors.length] || '#fff';
+      div.classList.add('owned');
+      div.style.outlineColor = color;
+      // set initial garrison label
+      const rec = castleGarrisons.get(ckey);
+      const span = div.querySelector('span');
+      if (span) span.innerHTML = `${label} — Garrison: <img src="army-icon.png" class="army-glyph">${rec ? rec.troops : 0}`;
+      if (isLocal) {
+        div.classList.add("local-player");
+      }
+    });
+
+    for (let i = 0; i < players.length; i++) syncCastleGarrison(i);
+    positions.forEach(([x, y]) => updateCastleVisual(`${x},${y}`));
+    updateCenterVisual();
+
+    // Farms (random generation)
+    const farms = [];
+    while (farms.length < 24) {
+      const x = Math.floor(Math.random() * 80) + 10;
+      const y = Math.floor(Math.random() * 80) + 10;
+      farms.push([x, y]);
+    }
+    farms.forEach(([x, y]) => {
+      const key = `${x},${y}`;
+      farmsMap.set(key, true);
+      const el = addObject('mine', x, y, 'Farm', () => {
+        const owner = farmOwners.get(key);
+        const isOurs = owner && owner.ownerIndex === 0;
+        if (isOurs && owner.troops > 0) {
+          // Recall interface
+          createInputPopup(`Recall from your farm (max ${owner.troops})`, owner.troops, (count) => {
+            // send back to local castle
+            owner.troops -= count;
+            farmOwners.set(key, owner);
+            updateFarmVisual(key);
+            const time = Math.floor(Math.random() * 5) + 3;
+            sendTroops(x, y, localPlayerPos.x, localPlayerPos.y, time, {
+              ownerIndex: 0,
+              onArrival: () => {
+                // Move recalled troops into available army and sync castle UI
+                players[0].army = (players[0].army || 0) + count;
+                army += count;
+                armyText.textContent = army;
+                syncCastleGarrison(0);
+              }
+            });
+          });
+          return;
+        }
+        // Otherwise behave as attack/send as before
+        if (army > 0) {
+          createTroopPopup(['infantry', 'archer', 'cavalry', 'militia'], {
+            infantry: army, archer: army, cavalry: army, militia: army
+          }, (selectedTroops, totalSent) => {
+            army -= totalSent;
+            armyText.textContent = army;
+            players[0].army = army;
+            syncCastleGarrison(0);
+            const time = Math.floor(Math.random() * 5) + 3;
+            const ownerIndex = 0; // local player
+            const ownerLabel = 'Player 1';
+            sendTroops(localPlayerPos.x, localPlayerPos.y, x, y, time, {
+              ownerIndex,
+              payload: { key, ownerIndex, ownerLabel, troops: totalSent },
+              onArrival: (p) => {
+                const existing = farmOwners.get(p.key);
+                if (existing && existing.ownerIndex !== p.ownerIndex) {
+                  // Battle on the farm
+                  const { attLeft, defLeft } = resolveBattle(p.troops, existing.troops);
+                  if (attLeft > 0) {
+                    farmOwners.set(p.key, { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: attLeft });
+                  } else {
+                    farmOwners.set(p.key, { ownerIndex: existing.ownerIndex, ownerLabel: existing.ownerLabel, troops: defLeft });
+                  }
+                } else {
+                  const rec = existing || { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: 0 };
+                  rec.ownerIndex = p.ownerIndex; rec.ownerLabel = p.ownerLabel; rec.troops += p.troops;
+                  farmOwners.set(p.key, rec);
+                }
+                updateFarmVisual(p.key);
+                const lf = countFarmsOwned(0);
+                farmsText.textContent = lf;
+                incomeText.textContent = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+              }
+            });
+            createInfoPopup(`Sending troops to farm. Arrival in ${time} seconds.`);
+          });
+        } else {
+          createInfoPopup('No troops available!');
+        }
+      });
+      el.dataset.key = key;
+      farmElements.set(key, el);
+    });
+
+    // --- Simple AI ---
+    function aiHireAndAct(ai) {
+      // Hire if possible: prefer militia (30) for numbers
+      const cost = 30;
+      const canBuy = Math.floor(ai.gold / cost);
+      if (canBuy > 0) {
+        const toBuy = Math.min(canBuy, 5 + Math.floor(Math.random() * 10));
+        ai.gold -= toBuy * cost;
+        ai.army += toBuy;
+      }
+      if (ai.army === 0) return;
+      const send = Math.max(1, Math.floor(ai.army * (0.2 + Math.random() * 0.5)));
+      ai.army -= send;
+      syncCastleGarrison(ai.index);
+      const r = Math.random();
+      if (r < 0.20) {
+        // 20% chance: attack/capture the central castle
+        sendTroops(ai.x, ai.y, 50, 50, null, {
+          ownerIndex: ai.index,
+          payload: { sent: send, attackerIndex: ai.index },
+          onArrival: (p) => {
+            if (centralOwnerIndex === null) {
+              const { attLeft, defLeft } = resolveBattle(p.sent, centerDefense);
+              centerDefense = defLeft;
+              if (attLeft > 0 && defLeft === 0) {
+                centralOwnerIndex = p.attackerIndex;
+                centralGarrison = attLeft;
+              }
+            } else if (centralOwnerIndex === p.attackerIndex) {
+              centralGarrison += p.sent;
+            } else {
+              const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
+              if (attLeft > 0 && defLeft === 0) {
+                centralOwnerIndex = p.attackerIndex;
+                centralGarrison = attLeft;
+              } else {
+                centralGarrison = defLeft;
+              }
+            }
+            updateCenterVisual();
+          }
+        });
+      } else if (r < 0.55) {
+        // 35% chance: attack a random enemy castle
+        const enemyIndices = players.map(p => p.index).filter(idx => idx !== ai.index);
+        const targetIdx = enemyIndices[Math.floor(Math.random() * enemyIndices.length)];
+        const [tx, ty] = positions[targetIdx];
+        const key = `${tx},${ty}`;
+        sendTroops(ai.x, ai.y, tx, ty, null, {
+          ownerIndex: ai.index,
+          payload: { key, defenderIndex: targetIdx, sent: send, attackerIndex: ai.index, originX: ai.x, originY: ai.y, targetX: tx, targetY: ty },
+          onArrival: (p) => {
+            const defenderArmy = players[p.defenderIndex].army || 0;
+            const { attLeft, defLeft } = resolveBattle(p.sent, defenderArmy);
+            players[p.defenderIndex].army = defLeft;
+            syncCastleGarrison(p.defenderIndex);
+            if (attLeft > 0 && defLeft === 0) {
+              const victim = players[p.defenderIndex];
+              const stealMax = Math.floor(victim.gold * 0.10);
+              const loot = Math.min(stealMax, 150);
+              victim.gold -= loot; players[ai.index].gold += loot;
+              sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, ai.index);
+            }
+          }
+        });
+      } else {
+        // 45% chance: attack a random farm
+        const farmKeys = Array.from(farmsMap.keys());
+        if (farmKeys.length === 0) return;
+        const key = farmKeys[Math.floor(Math.random() * farmKeys.length)];
+        const [fx, fy] = key.split(',').map(Number);
+        sendTroops(ai.x, ai.y, fx, fy, null, {
+          ownerIndex: ai.index,
+          payload: { key, ownerIndex: ai.index, ownerLabel: ai.label, troops: send },
+          onArrival: (p) => {
+            const existing = farmOwners.get(p.key);
+            if (existing && existing.ownerIndex !== p.ownerIndex) {
+              const { attLeft, defLeft } = resolveBattle(p.troops, existing.troops);
+              if (attLeft > 0) {
+                farmOwners.set(p.key, { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: attLeft });
+              } else {
+                farmOwners.set(p.key, { ownerIndex: existing.ownerIndex, ownerLabel: existing.ownerLabel, troops: defLeft });
+              }
+            } else {
+              const rec = existing || { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: 0 };
+              rec.ownerIndex = p.ownerIndex; rec.ownerLabel = p.ownerLabel; rec.troops += p.troops;
+              farmOwners.set(p.key, rec);
+            }
+            updateFarmVisual(p.key);
+            players[ai.index] = ai;
+            const lf = countFarmsOwned(0);
+            farmsText.textContent = lf;
+            incomeText.textContent = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+          }
+        });
+      }
+    }
+
+    // Run AI for players 2..8 with jittered schedule (6–12s between actions)
+    function scheduleAI(ai) {
+      const delay = 6000 + Math.random() * 6000; // 6–12 seconds
+      setTimeout(() => {
+        aiHireAndAct(ai);
+        scheduleAI(ai); // reschedule with new jitter
+      }, delay);
+    }
+    for (let i = 1; i < players.length; i++) {
+      scheduleAI(players[i]);
+    }
+
+    // Ensure initial sidebar render runs once at startup
+    renderPlayerSidebar();
+  </script>
+</body>
+</html>
