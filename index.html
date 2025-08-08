@@ -141,6 +141,19 @@
     .player-row { display:flex; align-items:center; justify-content:space-between; padding:6px 4px; }
     .player-meta { display:flex; align-items:center; gap:8px; }
     .player-dot { width:10px; height:10px; border-radius:50%; outline:1px solid rgba(0,0,0,0.4); }
+    .win-badge { 
+      min-width: 18px; 
+      text-align: center; 
+      padding: 2px 4px; 
+      margin-right: 6px; 
+      border-radius: 4px; 
+      background: rgba(255,215,0,0.18); 
+      border: 1px solid rgba(255,215,0,0.55); 
+      color: #ffd700; 
+      font-weight: 700; 
+      font-size: 12px; 
+      font-variant-numeric: tabular-nums;
+    }
     .player-gold { font-variant-numeric: tabular-nums; }
     .player-income { font-variant-numeric: tabular-nums; opacity: 0.9; }
     .player-row .cols { display:flex; align-items:center; gap:12px; }
@@ -321,6 +334,16 @@
       gold: 500,
       army: 0,
     }));
+
+    // Wins tracking (per session; persisted via localStorage)
+    players.forEach(p => { p.wins = 0; });
+    try {
+      const savedWins = localStorage.getItem('playerWins');
+      if (savedWins) {
+        const arr = JSON.parse(savedWins);
+        arr.forEach((w, idx) => { if (players[idx]) players[idx].wins = Number(w) || 0; });
+      }
+    } catch {}
 
     // Ensure each player has per-type army buckets
     players.forEach((p) => {
@@ -600,6 +623,13 @@
       matchEnded = true;
       // winner by current gold
       const winner = [...players].sort((a,b)=> b.gold - a.gold)[0];
+      // increment wins and persist
+      if (winner && typeof winner.index === 'number') {
+        players[winner.index].wins = (players[winner.index].wins || 0) + 1;
+        try { localStorage.setItem('playerWins', JSON.stringify(players.map(p => p.wins || 0))); } catch {}
+      }
+      // refresh sidebar to show updated badges
+      renderPlayerSidebar();
       const container = document.createElement('div');
       container.innerHTML = `
         <h3>Time's up!</h3>
@@ -992,15 +1022,20 @@
         const row = document.createElement('div');
         row.className = 'player-row';
 
-        // left: color dot + name
+        // left: win badge + color dot + name
         const meta = document.createElement('div');
         meta.className = 'player-meta';
+        const win = document.createElement('div');
+        win.className = 'win-badge';
+        // show empty until first win to match design request
+        win.textContent = (p.wins && p.wins > 0) ? String(p.wins) : '';
+        win.title = (p.wins && p.wins > 0) ? `${p.wins} wins` : 'No wins yet';
         const dot = document.createElement('div');
         dot.className = 'player-dot';
         dot.style.background = playerColors[p.index % playerColors.length] || '#fff';
         const name = document.createElement('div');
         name.textContent = p.label;
-        meta.append(dot, name);
+        meta.append(win, dot, name);
 
         // middle: live income per minute (net: gross income minus auto-hire estimate)
         const farmsOwned = countFarmsOwned(p.index);
