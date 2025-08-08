@@ -50,6 +50,8 @@
       padding: 10px;
       border-radius: 8px;
       font-size: 14px;
+      z-index: 60;              /* above moving icons/lines */
+      pointer-events: auto;     /* ensure clicks land */
     }
     #troop-panel {
       position: fixed;         /* detached from playfield */
@@ -151,6 +153,8 @@
     .tiny-btn.on  { background: rgba(46,204,113,0.35); border-color: rgba(46,204,113,0.6); }
     .tiny-btn.off { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.35); opacity: 0.9; }
     .troop-slot { display:flex; flex-direction:column; align-items:center; gap:6px; min-width: 160px; }
+    /* Make sure inputs inside #ui always receive clicks */
+    #ui button, #ui select { pointer-events: auto; }
   </style>
 </head>
 <body>
@@ -165,6 +169,16 @@
       <div style="margin-top:6px; display:flex; align-items:center; gap:8px;">
         <div>Game Speed: <span id="speed-label">x1</span></div>
         <input id="speed-slider" type="range" min="1" max="10" step="1" value="1" style="width:140px;" />
+      </div>
+      <div style="margin-top:6px; display:flex; align-items:center; gap:8px;">
+        <div>Local AI:</div>
+        <button id="toggle-local-ai" class="tiny-btn off">OFF</button>
+        <select id="local-ai-profile" style="font-size:12px; padding:2px 4px; border-radius:6px;">
+          <option value="Balanced">Balanced</option>
+          <option value="Hoarder">Hoarder</option>
+          <option value="Skirmisher">Skirmisher</option>
+          <option value="Opportunist">Opportunist</option>
+        </select>
       </div>
     </div>
     <details id="sidebar" open>
@@ -209,10 +223,10 @@
 
     // --- Auto-hiring (per minute) rates ---
     const autoHireRatesPerMin = {
-      militia: 0.10,
-      infantry: 0.20,
-      archer: 0.15,
-      cavalry: 0.40,
+      militia: 0.50,
+      infantry: 0.80,
+      archer: 0.5,
+      cavalry: 1.00,
     };
 
     // --- Full unit purchase costs (used by auto-hire when buying) ---
@@ -228,8 +242,13 @@
     const LOOT_MAX_PCT = 0.30;   // 30%
     const RICH_GOLD_THRESHOLD = 600; // when an opponent is "rich", bots will also harass their farms
 
+    // Raids should target only reasonably rich opponents; otherwise prefer farms/defense
+    const RAID_MIN_TARGET_GOLD = 200; // skip castle raids if defender has less gold than this
+
     // If a bot can inflict >=1% damage to the central castle this push, use this base chance to prefer a center push
-    const CENTER_ONEPUSH_CHANCE = 0.7; // 70% base chance (can be overridden per profile)
+    const CENTER_ONEPUSH_CHANCE = 0.85; // 85% base chance (bots value center more)
+    // Limit for aggressive farm sweeps: only nearby weak farms (board is 0..100)
+    const SWEEP_MAX_RADIUS = 35; // percent units; ~35% of board width
 
     function calcRandomLoot(amount) {
       const pct = LOOT_MIN_PCT + Math.random() * (LOOT_MAX_PCT - LOOT_MIN_PCT);
@@ -331,7 +350,8 @@
           sendPercentMin: 0.25,
           sendPercentMax: 0.50,
           keepBackMin: 0.30,
-          multiActCap: 2
+          multiActCap: 2,
+          sweepMaxTargets: 2
         };
       } else if (roll < 0.5) {
         // Skirmisher:
@@ -353,7 +373,8 @@
           sendPercentMin: 0.10,
           sendPercentMax: 0.30,
           keepBackMin: 0.15,
-          multiActCap: 3
+          multiActCap: 3,
+          sweepMaxTargets: 3
         };
       } else if (roll < 0.75) {
         // Opportunist:
@@ -375,7 +396,8 @@
           sendPercentMin: 0.20,
           sendPercentMax: 0.45,
           keepBackMin: 0.25,
-          multiActCap: 3
+          multiActCap: 3,
+          sweepMaxTargets: 3
         };
       }
       // Balanced (fallback)
@@ -397,8 +419,103 @@
         sendPercentMin: 0.15,
         sendPercentMax: 0.40,
         keepBackMin: 0.20,
-        multiActCap: 2
+        multiActCap: 2,
+        sweepMaxTargets: 2
       };
+    }
+
+    // --- AI Profile factory by name ---
+    function createAIProfileByName(name) {
+      switch ((name || '').toLowerCase()) {
+        case 'hoarder':
+          return {
+            name: 'Hoarder',
+            actionDelayMin: 9000,
+            actionDelayMax: 14000,
+            sendFracMin: 0.20,
+            sendFracMax: 0.40,
+            urgentBoost: 1.4,
+            recallChance: 0.45,
+            recallThreshold: 8,
+            recallMaxFarms: 3,
+            centerAggression: 1.2,
+            farmBias: 1.0,
+            raidBias: 0.9,
+            centerPushChance: 0.65,
+            percentDecisionChance: 0.80,
+            sendPercentMin: 0.25,
+            sendPercentMax: 0.50,
+            keepBackMin: 0.30,
+            multiActCap: 2,
+            sweepMaxTargets: 2
+          };
+        case 'skirmisher':
+          return {
+            name: 'Skirmisher',
+            actionDelayMin: 4000,
+            actionDelayMax: 7000,
+            sendFracMin: 0.15,
+            sendFracMax: 0.35,
+            urgentBoost: 1.2,
+            recallChance: 0.20,
+            recallThreshold: 6,
+            recallMaxFarms: 1,
+            centerAggression: 1.0,
+            farmBias: 1.2,
+            raidBias: 1.1,
+            centerPushChance: 0.55,
+            percentDecisionChance: 0.50,
+            sendPercentMin: 0.10,
+            sendPercentMax: 0.30,
+            keepBackMin: 0.15,
+            multiActCap: 3,
+            sweepMaxTargets: 3
+          };
+        case 'opportunist':
+          return {
+            name: 'Opportunist',
+            actionDelayMin: 6000,
+            actionDelayMax: 10000,
+            sendFracMin: 0.25,
+            sendFracMax: 0.50,
+            urgentBoost: 1.3,
+            recallChance: 0.30,
+            recallThreshold: 7,
+            recallMaxFarms: 2,
+            centerAggression: 1.5,
+            farmBias: 1.1,
+            raidBias: 1.0,
+            centerPushChance: 0.85,
+            percentDecisionChance: 0.70,
+            sendPercentMin: 0.20,
+            sendPercentMax: 0.45,
+            keepBackMin: 0.25,
+            multiActCap: 3,
+            sweepMaxTargets: 3
+          };
+        default:
+          return {
+            name: 'Balanced',
+            actionDelayMin: 6000,
+            actionDelayMax: 12000,
+            sendFracMin: 0.25,
+            sendFracMax: 0.35,
+            urgentBoost: 1.2,
+            recallChance: 0.25,
+            recallThreshold: 8,
+            recallMaxFarms: 2,
+            centerAggression: 1.2,
+            farmBias: 1.0,
+            raidBias: 1.0,
+            centerPushChance: 0.7,
+            percentDecisionChance: 0.60,
+            sendPercentMin: 0.15,
+            sendPercentMax: 0.40,
+            keepBackMin: 0.20,
+            multiActCap: 2,
+            sweepMaxTargets: 2
+          };
+      }
     }
 
     // Assign a random profile to every bot (players 2..8)
@@ -731,6 +848,7 @@
     }
     refreshSpeedUI();
 
+
     if (speedSlider) {
       speedSlider.oninput = () => {
         const v = parseInt(speedSlider.value);
@@ -740,6 +858,62 @@
         showToast(`Speed: x${gameSpeed}`);
       };
     }
+
+    // --- Local AI control (player 0) ---
+    const toggleLocalAIButton = document.getElementById('toggle-local-ai');
+    const localAIProfileSelect = document.getElementById('local-ai-profile');
+    let localAIEnabled = false;
+
+    // Restore saved state
+    try {
+      const savedLocalAI = localStorage.getItem('localAIEnabled');
+      const savedProfile = localStorage.getItem('localAIProfileName');
+      if (savedProfile && localAIProfileSelect) localAIProfileSelect.value = savedProfile;
+      if (savedLocalAI !== null) localAIEnabled = JSON.parse(savedLocalAI);
+    } catch {}
+
+    function refreshLocalAIUI() {
+      if (!toggleLocalAIButton) return;
+      toggleLocalAIButton.textContent = localAIEnabled ? 'ON' : 'OFF';
+      toggleLocalAIButton.classList.remove('on','off');
+      toggleLocalAIButton.classList.add(localAIEnabled ? 'on' : 'off');
+      toggleLocalAIButton.title = localAIEnabled ? 'Local player is AI-controlled' : 'Local player is human-controlled';
+    }
+    refreshLocalAIUI();
+
+    function applyLocalAIProfile() {
+      const name = localAIProfileSelect ? localAIProfileSelect.value : 'Balanced';
+      players[0].aiProfile = createAIProfileByName(name);
+      try { localStorage.setItem('localAIProfileName', name); } catch {}
+    }
+
+    if (localAIProfileSelect) {
+      localAIProfileSelect.addEventListener('change', () => {
+        applyLocalAIProfile();
+        if (localAIEnabled) { if (players[0]._aiTimerId) clearTimeout(players[0]._aiTimerId); scheduleAI(players[0]); }
+        showToast(`Local AI profile: ${localAIProfileSelect.value}`);
+      }, { passive: true });
+    }
+
+    if (toggleLocalAIButton) {
+      toggleLocalAIButton.addEventListener('click', (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        localAIEnabled = !localAIEnabled;
+        try { localStorage.setItem('localAIEnabled', JSON.stringify(localAIEnabled)); } catch {}
+        refreshLocalAIUI();
+        if (localAIEnabled) {
+          applyLocalAIProfile();
+          scheduleAI(players[0]);
+          showToast('Local AI enabled');
+        } else {
+          if (players[0]._aiTimerId) { clearTimeout(players[0]._aiTimerId); players[0]._aiTimerId = null; }
+          showToast('Local AI disabled');
+        }
+      }, { passive: true });
+    }
+
+    // If enabled from previous session, start immediately
+    if (localAIEnabled) { applyLocalAIProfile(); scheduleAI(players[0]); }
 
     const toggleAutoBtn = document.getElementById('toggle-autohire');
     function refreshAutoHireBtn() {
@@ -1457,6 +1631,8 @@
       }
       const [cx, cy] = positions[pick];
       const def = players[pick].army || 0;
+      // If target is not rich enough, skip raiding — prefer farms/expansion
+      if ((players[pick].gold || 0) < RAID_MIN_TARGET_GOLD) return null;
       return { defenderIndex: pick, cx, cy, def };
     }
 
@@ -1466,6 +1642,91 @@
       }
       if (centralOwnerIndex === ai.index) return false; // already own
       return sendAmount > centralGarrison; // beat current owner's garrison
+    }
+
+    // --- Aggression Helpers: superiority check & sweeping weak farms ---
+    function averageOpponentTroops(ai) {
+      let sum = 0, n = 0;
+      players.forEach((p) => {
+        if (p.index === ai.index) return;
+        sum += getTotalTroops(p.index);
+        n++;
+      });
+      return n > 0 ? (sum / n) : 0;
+    }
+
+    // Try to rapidly capture several weakest farms when we are stronger than average.
+    // Returns true if at least one attack was launched.
+    function aiAggressiveSweep(ai) {
+      const prof = ai.aiProfile || {};
+      const keepP = Math.max(0, Math.min(0.95, prof.keepBackMin || 0.2));
+      const maxTargets = Math.max(1, prof.sweepMaxTargets || 3);
+
+      // Build candidate list: all farms not ours, with defenders asc, within radius
+      const candidates = [];
+      const maxD2 = SWEEP_MAX_RADIUS * SWEEP_MAX_RADIUS;
+      farmsMap.forEach((_, key) => {
+        const rec = farmOwners.get(key) || null;
+        const [fx, fy] = parseKeyToXY(key);
+        const d2 = distSq(ai.x, ai.y, fx, fy);
+        if (d2 > maxD2) return; // skip far targets during sweep
+        if (!rec) {
+          // neutral farm: def = 0
+          candidates.push({ key, fx, fy, def: 0, ownerIndex: null });
+        } else if (rec.ownerIndex !== ai.index) {
+          candidates.push({ key, fx, fy, def: rec.troops || 0, ownerIndex: rec.ownerIndex });
+        }
+      });
+      if (candidates.length === 0) return false;
+
+      // Sort by defenders asc, then by distance asc
+      candidates.sort((a, b) => {
+        if (a.def !== b.def) return a.def - b.def;
+        const da = distSq(ai.x, ai.y, a.fx, a.fy);
+        const db = distSq(ai.x, ai.y, b.fx, b.fy);
+        return da - db;
+      });
+
+      let launched = 0;
+      for (const target of candidates.slice(0, maxTargets)) {
+        const keep = Math.floor(ai.army * keepP);
+        const cap = Math.max(0, ai.army - keep);
+        const need = Math.max(1, Math.min(cap, (target.def || 0) + 1));
+        if (need <= 0) continue;
+        if (cap < need) continue; // not enough without breaking keep-back
+
+        // Deduct from AI garrison
+        ai.army -= need;
+        ensureArmyBuckets(ai);
+        const take = Math.min(need, ai._armyByType.militia || 0);
+        ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+        syncCastleGarrison(ai.index);
+
+        // Launch to farm
+        sendTroops(ai.x, ai.y, target.fx, target.fy, null, {
+          ownerIndex: ai.index,
+          payload: { key: target.key, ownerIndex: ai.index, ownerLabel: ai.label, troops: need },
+          onArrival: (p) => {
+            const existing = farmOwners.get(p.key);
+            if (existing && existing.ownerIndex !== p.ownerIndex) {
+              const { attLeft, defLeft } = resolveBattle(p.troops, existing.troops);
+              if (attLeft > 0) {
+                farmOwners.set(p.key, { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: attLeft });
+              } else {
+                farmOwners.set(p.key, { ownerIndex: existing.ownerIndex, ownerLabel: existing.ownerLabel, troops: defLeft });
+              }
+            } else {
+              const rec = existing || { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: 0 };
+              rec.ownerIndex = p.ownerIndex; rec.ownerLabel = p.ownerLabel; rec.troops += p.troops;
+              farmOwners.set(p.key, rec);
+            }
+            updateFarmVisual(p.key);
+          }
+        });
+        launched++;
+        if (ai.army <= 0) break;
+      }
+      return launched > 0;
     }
 
     // --- Value/Difficulty Scoring Helpers ---
@@ -1506,7 +1767,10 @@
         // If we can capture on this push, also add the remaining pool
         const capturePool = (send > centerDefense ? Math.floor(centerRewardPool) : 0);
 
-        score = expectedPoolAward + fixedReward + bonus + poolBoost + capturePool - penalty;
+        // Expected future income if we likely capture soon: 200/min over remaining time, weighted by capture likelihood
+        const captureLikelihood = Math.min(1, send / Math.max(1, centerDefense));
+        const incomeFuture = Math.floor(200 * timeLeftMin * captureLikelihood * 0.8);
+        score = expectedPoolAward + fixedReward + bonus + poolBoost + capturePool + incomeFuture - penalty;
       } else if (centralOwnerIndex !== ai.index) {
         // Center owned by someone: only consider if we can breach at least 1% of defense
         const pctPerStep = centerDefenseMax / 100;
@@ -1518,15 +1782,18 @@
         // Use playerIncomes if available, else estimate (farms owned * 10 + 30 + 200)
         let ownerIncome = 0;
         if (typeof playerIncomes !== 'undefined' && playerIncomes[centralOwnerIndex] !== undefined) {
-          ownerIncome = playerIncomes[centralOwnerIndex] + 200;
+          ownerIncome = playerIncomes[centralOwnerIndex] + 200; // assume playerIncomes already reflects 60/30 baseline
         } else {
-          // Estimate gross income
+          // Estimate gross income with 60 base and +30 per farm, plus +200 for owning center
           const farmsOwned = countFarmsOwned(centralOwnerIndex);
-          ownerIncome = 30 + farmsOwned * 10 + 200;
+          ownerIncome = 60 + farmsOwned * 30 + 200;
         }
         const ownerGold = owner.gold || 0;
         const potential = ownerIncome * 5 + ownerGold; // arbitrary scaling
         score += potential;
+        // Deny the owner's +200/min going forward as an additional incentive
+        const denyIncome = Math.floor(200 * timeLeftMin * 0.6);
+        score += denyIncome;
         score -= penalty;
       }
 
@@ -1540,13 +1807,14 @@
       const penalty = travelPenalty(ai.x, ai.y, farmTarget.fx, farmTarget.fy);
       const def = farmTarget.def || 0;
       if (send <= def) return -Infinity; // cannot win
-      // Income gain: +10/min for the remaining time if we flip or capture
-      const incomeGain = 10 * timeLeftMin;
-      // Neutral farms are even more attractive
-      const neutralBonus = (farmTarget.type === 'neutral-farm') ? 80 : 0;
+      // Income gain: +30/min for the remaining time if we flip or capture
+      const incomeGain = 30 * timeLeftMin;
+      // Neutral farms are even more attractive (stronger than before)
+      const neutralBonus = (farmTarget.type === 'neutral-farm') ? 150 : 0;
       // Softness bonus: the fewer defenders, the more attractive (0..180)
       const softness = Math.max(0, 6 - def) * 30;
-      return incomeGain + neutralBonus + softness - penalty;
+      // Prefer farms a bit more by reducing travel penalty weight
+      return incomeGain + neutralBonus + softness - (penalty * 0.7);
     }
 
     // Decide how many actions a bot can do in one tick (multi-action)
@@ -1579,6 +1847,13 @@
         ai.army += toBuy;
         ensureArmyBuckets(ai);
         ai._armyByType.militia += toBuy;
+      }
+
+      // Superiority trigger: if our army is larger than the average opponent garrison, sweep weakest farms
+      const avgOpp = averageOpponentTroops(ai);
+      const superior = ai.army >= Math.max(6, Math.ceil(avgOpp * 1.15)); // 15%+ above average
+      if (superior) {
+        aiAggressiveSweep(ai); // launch quick captures if available, then continue with remaining actions
       }
 
       // Multi-action core: attempt up to N actions this tick
@@ -1619,8 +1894,8 @@
 
         const centerScore = scoreCenter(ai, send) * (prof.centerAggression || 1);
 
-        // Choose higher score among center and farm; center must beat farm by 20% to take priority
-        let preferCenter = (centerScore > 0) && (centerScore >= farmDecision.score * 1.20);
+        // Choose higher score among center and farm; center must beat farm by 5% to take priority
+        let preferCenter = (centerScore > 0) && (centerScore >= farmDecision.score * 1.05);
 
         // Probabilistic override: if we can cross at least 1% this push, allow center with high chance even if farm is slightly better
         const pctPerStep = centerDefenseMax / 100;
@@ -1822,10 +2097,14 @@
       const span = Math.max(0, (prof.actionDelayMax - prof.actionDelayMin));
       const baseDelay = (prof.actionDelayMin || 6000) + Math.random() * span;
       const delay = Math.max(100, baseDelay / Math.max(1, gameSpeed)); // faster ticks at higher speed
-      setTimeout(() => {
+      if (ai._aiTimerId) { clearTimeout(ai._aiTimerId); ai._aiTimerId = null; }
+      ai._aiTimerId = setTimeout(() => {
         aiHireAndAct(ai);
         scheduleAI(ai); // reschedule with new jitter per profile
       }, delay);
+    }
+    function cancelAI(ai) {
+      if (ai && ai._aiTimerId) { clearTimeout(ai._aiTimerId); ai._aiTimerId = null; }
     }
     for (let i = 1; i < players.length; i++) {
       scheduleAI(players[i]);
@@ -1836,3 +2115,57 @@
   </script>
 </body>
 </html>
+    // --- Local AI control (player 0) ---
+    const toggleLocalAIButton = document.getElementById('toggle-local-ai');
+    const localAIProfileSelect = document.getElementById('local-ai-profile');
+    let localAIEnabled = false;
+
+    // restore saved state
+    try {
+      const savedLocalAI = localStorage.getItem('localAIEnabled');
+      const savedProfile = localStorage.getItem('localAIProfileName');
+      if (savedProfile && localAIProfileSelect) localAIProfileSelect.value = savedProfile;
+      if (savedLocalAI !== null) localAIEnabled = JSON.parse(savedLocalAI);
+    } catch {}
+
+    function refreshLocalAIUI() {
+      if (!toggleLocalAIButton) return;
+      toggleLocalAIButton.textContent = localAIEnabled ? 'ON' : 'OFF';
+      toggleLocalAIButton.classList.remove('on','off');
+      toggleLocalAIButton.classList.add(localAIEnabled ? 'on' : 'off');
+      toggleLocalAIButton.title = localAIEnabled ? 'Local player is AI-controlled' : 'Local player is human-controlled';
+    }
+    refreshLocalAIUI();
+
+    function applyLocalAIProfile() {
+      const name = localAIProfileSelect ? localAIProfileSelect.value : 'Balanced';
+      players[0].aiProfile = createAIProfileByName(name);
+      try { localStorage.setItem('localAIProfileName', name); } catch {}
+    }
+
+    if (localAIProfileSelect) {
+      localAIProfileSelect.onchange = () => {
+        applyLocalAIProfile();
+        if (localAIEnabled) { cancelAI(players[0]); scheduleAI(players[0]); }
+        showToast(`Local AI profile: ${localAIProfileSelect.value}`);
+      };
+    }
+
+    if (toggleLocalAIButton) {
+      toggleLocalAIButton.onclick = () => {
+        localAIEnabled = !localAIEnabled;
+        try { localStorage.setItem('localAIEnabled', JSON.stringify(localAIEnabled)); } catch {}
+        refreshLocalAIUI();
+        if (localAIEnabled) {
+          applyLocalAIProfile();
+          scheduleAI(players[0]);
+          showToast('Local AI enabled');
+        } else {
+          cancelAI(players[0]);
+          showToast('Local AI disabled');
+        }
+      };
+    }
+
+    // If enabled from previous session, start immediately
+    if (localAIEnabled) { applyLocalAIProfile(); scheduleAI(players[0]); }
