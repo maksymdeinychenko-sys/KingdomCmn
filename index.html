@@ -16,6 +16,8 @@
       height: 100vh;
       position: relative;
       background: url("bg.jpg") center/cover no-repeat;
+      padding-bottom: 110px; /* bar(90) + 20px breathing room */
+      box-sizing: border-box;
     }
     .object {
       position: absolute;
@@ -50,16 +52,22 @@
       font-size: 14px;
     }
     #troop-panel {
-      position: absolute;
+      position: fixed;         /* detached from playfield */
       bottom: 0;
       left: 0;
       right: 0;
-      background: rgba(0,0,0,0.7);
-      padding: 10px;
+      height: 90px;            /* thinner bar */
+      background: rgba(0,0,0,0.9); /* solid dark background */
+      padding: 10px 16px;      /* inner spacing */
       color: #fff;
       font-size: 14px;
       display: flex;
       justify-content: space-around;
+      align-items: center;
+      gap: 20px;
+      z-index: 40;             /* above map, below toasts */
+      border-top: 1px solid rgba(255,255,255,0.15);
+      backdrop-filter: blur(2px);
     }
     .troop-btn {
       background: #3a8;
@@ -135,11 +143,14 @@
     .player-income { font-variant-numeric: tabular-nums; opacity: 0.9; }
     .player-row .cols { display:flex; align-items:center; gap:12px; }
     .player-income small { opacity: 0.75; font-size: 12px; margin-left: 2px; }
-#toasts { position: absolute; bottom: 12px; right: 12px; z-index: 50; display: flex; flex-direction: column; gap: 8px; }
+#toasts { position: absolute; bottom: 102px; right: 12px; z-index: 50; display: flex; flex-direction: column; gap: 8px; }
 .toast { background: rgba(0,0,0,0.75); color:#fff; padding:8px 12px; border-radius:8px; font-size:13px; pointer-events:none; animation: fadeout 3s forwards; }
 @keyframes fadeout { 0%{opacity:1; transform:translateY(0)} 80%{opacity:1} 100%{opacity:0; transform:translateY(10px)} }
     .tiny-btn { margin-left: 6px; padding: 2px 6px; font-size: 11px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.4); background: rgba(255,255,255,0.12); color: #fff; cursor: pointer; }
     .tiny-btn:hover { background: rgba(255,255,255,0.22); }
+    .tiny-btn.on  { background: rgba(46,204,113,0.35); border-color: rgba(46,204,113,0.6); }
+    .tiny-btn.off { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.35); opacity: 0.9; }
+    .troop-slot { display:flex; flex-direction:column; align-items:center; gap:6px; min-width: 160px; }
   </style>
 </head>
 <body>
@@ -150,6 +161,7 @@
       <div>Army: <span id="army">0</span></div>
       <div>Farms: <span id="farms">0</span></div>
       <div>Income: <span id="income">10</span>/min <button id="toggle-net" class="tiny-btn">NET</button></div>
+      <div><button id="toggle-autohire" class="tiny-btn on">Auto-hire: ON</button></div>
     </div>
     <details id="sidebar" open>
       <summary>
@@ -159,10 +171,22 @@
       <div class="player-list" id="player-list"></div>
     </details>
     <div id="troop-panel">
-      <div class="troop-btn" onclick="hire('infantry', 50)">Hire Infantry (50)</div>
-      <div class="troop-btn" onclick="hire('archer', 70)">Hire Archer (70)</div>
-      <div class="troop-btn" onclick="hire('cavalry', 100)">Hire Cavalry (100)</div>
-      <div class="troop-btn" onclick="hire('militia', 30)">Hire Militia (30)</div>
+      <div class="troop-slot">
+        <div class="troop-btn" onclick="hire('infantry', 50)">Hire Infantry (50)</div>
+        <button id="toggle-autohire-infantry" class="tiny-btn on">Auto: ON</button>
+      </div>
+      <div class="troop-slot">
+        <div class="troop-btn" onclick="hire('archer', 70)">Hire Archer (70)</div>
+        <button id="toggle-autohire-archer" class="tiny-btn on">Auto: ON</button>
+      </div>
+      <div class="troop-slot">
+        <div class="troop-btn" onclick="hire('cavalry', 100)">Hire Cavalry (100)</div>
+        <button id="toggle-autohire-cavalry" class="tiny-btn on">Auto: ON</button>
+      </div>
+      <div class="troop-slot">
+        <div class="troop-btn" onclick="hire('militia', 30)">Hire Militia (30)</div>
+        <button id="toggle-autohire-militia" class="tiny-btn on">Auto: ON</button>
+      </div>
     </div>
     <div id="toasts"></div>
   </div>
@@ -185,6 +209,14 @@
       infantry: 0.10,
       archer: 0.10,
       cavalry: 0.20,
+    };
+
+    // --- Full unit purchase costs (used by auto-hire when buying) ---
+    const unitCosts = {
+      infantry: 50,
+      archer: 70,
+      cavalry: 100,
+      militia: 30,
     };
 
     // Central Castle ownership model
@@ -228,11 +260,16 @@
       }
     }
 
+    // Safe playfield bounds so objects don't sit under the bottom HUD
+    const SAFE_MIN_Y = 6;   // small top margin
+    const SAFE_MAX_Y = 82;  // keep bottom clear of the 90px HUD
+
     // --- Players / Ownership model ---
-    const positions = [
+    const positionsRaw = [
       [20, 10], [50, 10], [80, 20], [90, 50],
       [80, 80], [50, 90], [20, 80], [10, 50],
     ];
+    const positions = positionsRaw.map(([x, y]) => [x, Math.min(Math.max(y, SAFE_MIN_Y), SAFE_MAX_Y)]);
     const players = positions.map(([x, y], i) => ({
       index: i,
       label: `Player ${i + 1}`,
@@ -394,19 +431,22 @@
       updateCastleVisual(ckey);
     }
 
-    // Auto-hire one unit per type if player has enough gold for that type (costs are per minute)
+    // Auto-hire one unit per type if player has enough gold for that type (spends full price per unit)
     function autoHireArmy(player) {
       if (!player) return;
+      // Human player's auto-hire can be toggled via UI; AI ignores this flag
+      if (player.index === 0 && !autoHireEnabled) return;
       if (!player._armyByType) player._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
       let _spent = 0;
       const _added = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
-      for (const [type, cost] of Object.entries(autoHireRatesPerMin)) {
-        if (player.gold >= cost) {
-          player.gold -= cost;
+      for (const type of Object.keys(unitCosts)) {
+        const price = unitCosts[type];
+        if ((player.index !== 0 || autoHireTypeEnabled[type]) && player.gold >= price) {
+          player.gold -= price;
           player._armyByType[type] += 1;
           player.army = (player.army || 0) + 1;
           syncCastleGarrison(player.index);
-          _spent += cost;
+          _spent += price;
           _added[type] += 1;
           // Update local UI if it's the human player
           if (player.index === 0) {
@@ -424,12 +464,29 @@
         for (const t of Object.keys(_added)) {
           if (_added[t] > 0) parts.push(`+${_added[t]} ${t}`);
         }
-        if (parts.length) showToast(`Auto-hire: ${parts.join(', ')} (-${_spent.toFixed(2)} gold)`);
+        if (parts.length) showToast(`Auto-hire: ${parts.join(', ')} (-${_spent} gold)`);
       }
     }
 
     // --- Income toggle ---
     let _showNet = true; // NET by default; toggle switches between NET and GROSS
+
+    // --- Auto-hire toggle (persisted) ---
+    let autoHireEnabled = true;
+    try {
+      const savedAuto = localStorage.getItem('autoHireEnabled');
+      if (savedAuto !== null) autoHireEnabled = JSON.parse(savedAuto);
+    } catch {}
+
+    // --- Auto-hire per-type toggles (persisted) ---
+    let autoHireTypeEnabled = { militia: true, infantry: true, archer: true, cavalry: true };
+    try {
+      const savedTypes = localStorage.getItem('autoHireTypeEnabled');
+      if (savedTypes) {
+        const parsed = JSON.parse(savedTypes);
+        autoHireTypeEnabled = { ...autoHireTypeEnabled, ...parsed };
+      }
+    } catch {}
 
     // Continuous per-second income with integer gold increases
     players.forEach(p => p._goldAcc = 0);
@@ -504,6 +561,56 @@
         incomeText.textContent = incomeVal;
         // Refresh sidebar
         renderPlayerSidebar();
+      };
+    }
+
+    const toggleAutoBtn = document.getElementById('toggle-autohire');
+    function refreshAutoHireBtn() {
+      if (!toggleAutoBtn) return;
+      toggleAutoBtn.textContent = autoHireEnabled ? 'Auto-hire: ON' : 'Auto-hire: OFF';
+      toggleAutoBtn.classList.remove('on','off');
+      toggleAutoBtn.classList.add(autoHireEnabled ? 'on' : 'off');
+      toggleAutoBtn.title = autoHireEnabled ? 'Automatic hiring is enabled' : 'Automatic hiring is disabled';
+    }
+    refreshAutoHireBtn();
+    if (toggleAutoBtn) {
+      toggleAutoBtn.onclick = () => {
+        autoHireEnabled = !autoHireEnabled;
+        try { localStorage.setItem('autoHireEnabled', JSON.stringify(autoHireEnabled)); } catch {}
+        refreshAutoHireBtn();
+        showToast(autoHireEnabled ? 'Auto-hire enabled' : 'Auto-hire disabled');
+      };
+    }
+
+    // --- Auto-hire per-type button wiring and state ---
+    const perTypeBtns = {
+      militia: document.getElementById('toggle-autohire-militia'),
+      infantry: document.getElementById('toggle-autohire-infantry'),
+      archer: document.getElementById('toggle-autohire-archer'),
+      cavalry: document.getElementById('toggle-autohire-cavalry'),
+    };
+
+    function refreshPerTypeBtns() {
+      for (const t of Object.keys(perTypeBtns)) {
+        const btn = perTypeBtns[t];
+        if (!btn) continue;
+        const on = !!autoHireTypeEnabled[t];
+        btn.textContent = `${t.charAt(0).toUpperCase()+t.slice(1)}: ${on ? 'ON' : 'OFF'}`;
+        btn.classList.remove('on','off');
+        btn.classList.add(on ? 'on' : 'off');
+        btn.title = on ? `Auto-hire ${t} is enabled` : `Auto-hire ${t} is disabled`;
+      }
+    }
+    refreshPerTypeBtns();
+
+    for (const t of Object.keys(perTypeBtns)) {
+      const btn = perTypeBtns[t];
+      if (!btn) continue;
+      btn.onclick = () => {
+        autoHireTypeEnabled[t] = !autoHireTypeEnabled[t];
+        try { localStorage.setItem('autoHireTypeEnabled', JSON.stringify(autoHireTypeEnabled)); } catch {}
+        refreshPerTypeBtns();
+        showToast(`${t} auto-hire ${autoHireTypeEnabled[t] ? 'enabled' : 'disabled'}`);
       };
     }
     let matchTimeLeft = 600; // 10 minutes
@@ -960,9 +1067,11 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
 
     // Farms (random generation)
     const farms = [];
+    const minX = 10, maxX = 90;
+    const minY = 10, maxY = SAFE_MAX_Y - 2; // keep farms above the HUD
     while (farms.length < 24) {
-      const x = Math.floor(Math.random() * 80) + 10;
-      const y = Math.floor(Math.random() * 80) + 10;
+      const x = Math.floor(Math.random() * (maxX - minX)) + minX;
+      const y = Math.floor(Math.random() * (maxY - minY)) + minY;
       farms.push([x, y]);
     }
     farms.forEach(([x, y]) => {
@@ -1051,31 +1160,187 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
       farmElements.set(key, el);
     });
 
+    // --- AI Farm Recall Helpers ---
+    function parseKeyToXY(key) {
+      const [sx, sy] = key.split(',');
+      return [Number(sx), Number(sy)];
+    }
+
+    // Recall troops from up to maxFarms AI-owned farms that have at least `threshold` troops.
+    // Returns total number of troops recalled (sum across farms).
+    function aiRecallFromFarms(ai, threshold = 10, maxFarms = 2) {
+      const owned = [];
+      farmOwners.forEach((rec, key) => {
+        if (rec.ownerIndex === ai.index && (rec.troops || 0) >= threshold) {
+          owned.push({ key, troops: rec.troops });
+        }
+      });
+      if (owned.length === 0) return 0;
+      // Recall from the largest farms first
+      owned.sort((a, b) => b.troops - a.troops);
+      const chosen = owned.slice(0, maxFarms);
+      let total = 0;
+      chosen.forEach(({ key, troops }) => {
+        const count = troops; // recall all from that farm
+        const rec = farmOwners.get(key);
+        if (!rec || rec.troops < count) return;
+        rec.troops -= count;
+        farmOwners.set(key, rec);
+        updateFarmVisual(key);
+        const [fx, fy] = parseKeyToXY(key);
+        // animate recall back to AI's castle
+        sendTroops(fx, fy, ai.x, ai.y, null, {
+          ownerIndex: ai.index,
+          onArrival: () => {
+            players[ai.index].army = (players[ai.index].army || 0) + count;
+            ensureArmyBuckets(players[ai.index]);
+            players[ai.index]._armyByType.militia += count; // attribute as militia for upkeep
+            syncCastleGarrison(ai.index);
+          }
+        });
+        total += count;
+      });
+      return total;
+    }
+
+    // --- Smarter AI Planning Helpers ---
+    function distSq(ax, ay, bx, by) { const dx = ax - bx, dy = ay - by; return dx*dx + dy*dy; }
+
+    function pickBestFarmTarget(ai) {
+      // Prefer: neutral farms first; otherwise enemy farms with the fewest defenders.
+      let best = null;
+      farmsMap.forEach((_, key) => {
+        const rec = farmOwners.get(key) || null;
+        const [fx, fy] = key.split(',').map(Number);
+        if (!rec) {
+          // neutral farm
+          const score = 120000 - distSq(ai.x, ai.y, fx, fy) * 0.5; // higher priority + softer distance penalty
+          if (!best || score > best.score) best = { type: 'neutral-farm', key, fx, fy, def: 0, score };
+        } else if (rec.ownerIndex !== ai.index) {
+          const def = rec.troops || 0;
+          const score = 50000 - def*5000 - distSq(ai.x, ai.y, fx, fy) * 0.5; // stronger penalty for defense, softer distance
+          if (!best || score > best.score) best = { type: 'enemy-farm', key, fx, fy, def, score };
+        }
+      });
+      return best; // {key, fx, fy, def}
+    }
+
+    function pickBestCastleRaid(ai) {
+      // Weighted roulette by current gold among opponents; probability ~ gold / sum(gold)
+      const pool = [];
+      let sum = 0;
+      players.forEach((p) => {
+        if (p.index === ai.index) return;
+        const w = Math.max(0, Math.floor(p.gold));
+        if (w > 0) { pool.push(p.index); sum += w; }
+      });
+      if (pool.length === 0) return null;
+      let pick = pool[0];
+      if (sum > 0) {
+        let r = Math.random() * sum;
+        for (const idx of pool) {
+          const w = Math.max(0, Math.floor(players[idx].gold));
+          if (r < w) { pick = idx; break; }
+          r -= w;
+        }
+      }
+      const [cx, cy] = positions[pick];
+      const def = players[pick].army || 0;
+      return { defenderIndex: pick, cx, cy, def };
+    }
+
+    function canTakeCenter(ai, sendAmount) {
+      if (centralOwnerIndex === null) {
+        return sendAmount > centerDefense; // beat neutral guard
+      }
+      if (centralOwnerIndex === ai.index) return false; // already own
+      return sendAmount > centralGarrison; // beat current owner's garrison
+    }
+
+    // --- Value/Difficulty Scoring Helpers ---
+    function travelPenalty(ax, ay, bx, by) {
+      const d = Math.hypot(ax - bx, ay - by); // 0..~141 on 0..100 grid
+      return d * 3; // softer distance penalty -> чаще выбираем фермы
+    }
+
+    function scoreCenter(ai, send) {
+      const timeLeftMin = Math.max(0, matchTimeLeft / 60);
+      const penalty = travelPenalty(ai.x, ai.y, 50, 50);
+      if (centralOwnerIndex === null) {
+        // Neutral: reward is 100 gold per 1% guard destroyed. 1% of 1000 = 10 defenders.
+        const potentialDamage = Math.min(send, centerDefense);
+        const steps = Math.floor(potentialDamage / (centerDefenseMax / 100)); // how many whole percents we likely cross
+        const reward = steps * 100;
+        return reward - penalty;
+      }
+      if (centralOwnerIndex === ai.index) return -Infinity; // already ours, deprioritize here
+      // Owned by someone else: value is +200/min for remaining time if we can capture
+      if (send > centralGarrison) {
+        const value = 200 * timeLeftMin;
+        return value - penalty;
+      }
+      return -Infinity; // can't take now
+    }
+
+    function scoreFarm(ai, farmTarget, send) {
+      const timeLeftMin = Math.max(0, matchTimeLeft / 60);
+      const penalty = travelPenalty(ai.x, ai.y, farmTarget.fx, farmTarget.fy);
+      const def = farmTarget.def || 0;
+      if (send <= def) return -Infinity; // cannot win
+      // Income gain: +10/min for the remaining time if we flip or capture
+      const incomeGain = 10 * timeLeftMin;
+      // Neutral farms are even more attractive
+      const neutralBonus = (farmTarget.type === 'neutral-farm') ? 80 : 0;
+      // Softness bonus: the fewer defenders, the more attractive (0..180)
+      const softness = Math.max(0, 6 - def) * 30;
+      return incomeGain + neutralBonus + softness - penalty;
+    }
+
     // --- Simple AI ---
     function aiHireAndAct(ai) {
-      // Hire if possible: prefer militia (30) for numbers
-      const cost = 30;
-      const canBuy = Math.floor(ai.gold / cost);
+      // 1) Consolidate sometimes (pull back from farms)
+      if (Math.random() < 0.25) {
+        const recalled = aiRecallFromFarms(ai, 8, 2); // threshold 8, up to 2 farms
+        if (recalled > 0) return; // wait for troops to come back this cycle
+      }
+
+      // 2) Buy militia if possible (keeps AI active)
+      const militiaCost = 30;
+      const canBuy = Math.floor(ai.gold / militiaCost);
       if (canBuy > 0) {
         const toBuy = Math.min(canBuy, 5 + Math.floor(Math.random() * 10));
-        ai.gold -= toBuy * cost;
+        ai.gold -= toBuy * militiaCost;
         ai.army += toBuy;
-        // PART 1.3.6: Attribute hired militia to militia bucket
         ensureArmyBuckets(ai);
         ai._armyByType.militia += toBuy;
       }
-      if (ai.army === 0) return;
-      const send = Math.max(1, Math.floor(ai.army * (0.2 + Math.random() * 0.5)));
-      ai.army -= send;
-      // PART 1.3.6: Deduct sent units from AI's militia bucket
-      if (ai._armyByType) {
-        const take = Math.min(send, ai._armyByType.militia || 0);
-        ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+
+      // 3) Decide send fraction based on time pressure
+      const urgent = (matchTimeLeft <= 120); // last 2 minutes
+      const frac = urgent ? (0.6 + Math.random() * 0.3) : (0.25 + Math.random() * 0.35);
+      let send = Math.max(1, Math.floor(ai.army * frac));
+      if (send <= 0) return;
+
+      // 4) Priorities by expected value vs difficulty
+      const farmTarget = pickBestFarmTarget(ai);
+      let farmDecision = { score: -Infinity, amount: 0 };
+      if (farmTarget && ai.army > farmTarget.def) {
+        const need = Math.min(ai.army, Math.max(1, farmTarget.def + 1));
+        const sendFarm = Math.max(1, Math.min(send, need));
+        farmDecision = { score: scoreFarm(ai, farmTarget, sendFarm), amount: sendFarm };
       }
-      syncCastleGarrison(ai.index);
-      const r = Math.random();
-      if (r < 0.20) {
-        // 20% chance: attack/capture the central castle
+
+      const centerScore = scoreCenter(ai, send);
+
+      // Choose higher score among center and farm; if both are poor, we'll consider a raid next
+      if (centerScore > farmDecision.score && centerScore > 0) {
+        // Attack center with `send`
+        ai.army -= send;
+        if (ai._armyByType) {
+          const take = Math.min(send, ai._armyByType.militia || 0);
+          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+        }
+        syncCastleGarrison(ai.index);
         sendTroops(ai.x, ai.y, 50, 50, null, {
           ownerIndex: ai.index,
           payload: { sent: send, attackerIndex: ai.index },
@@ -1085,56 +1350,31 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
               const { attLeft, defLeft } = resolveBattle(p.sent, before);
               centerDefense = defLeft;
               grantCenterGuardReward(p.attackerIndex, before, centerDefense);
-              if (attLeft > 0 && defLeft === 0) {
-                centralOwnerIndex = p.attackerIndex;
-                centralGarrison = attLeft;
-              }
+              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
             } else if (centralOwnerIndex === p.attackerIndex) {
               centralGarrison += p.sent;
             } else {
               const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
-              if (attLeft > 0 && defLeft === 0) {
-                centralOwnerIndex = p.attackerIndex;
-                centralGarrison = attLeft;
-              } else {
-                centralGarrison = defLeft;
-              }
+              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
+              else { centralGarrison = defLeft; }
             }
             updateCenterVisual();
           }
         });
-      } else if (r < 0.55) {
-        // 35% chance: attack a random enemy castle
-        const enemyIndices = players.map(p => p.index).filter(idx => idx !== ai.index);
-        const targetIdx = enemyIndices[Math.floor(Math.random() * enemyIndices.length)];
-        const [tx, ty] = positions[targetIdx];
-        const key = `${tx},${ty}`;
-        sendTroops(ai.x, ai.y, tx, ty, null, {
+        return;
+      }
+
+      if (farmDecision.score > 0) {
+        const sendFarm = farmDecision.amount;
+        ai.army -= sendFarm;
+        if (ai._armyByType) {
+          const take = Math.min(sendFarm, ai._armyByType.militia || 0);
+          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+        }
+        syncCastleGarrison(ai.index);
+        sendTroops(ai.x, ai.y, farmTarget.fx, farmTarget.fy, null, {
           ownerIndex: ai.index,
-          payload: { key, defenderIndex: targetIdx, sent: send, attackerIndex: ai.index, originX: ai.x, originY: ai.y, targetX: tx, targetY: ty },
-          onArrival: (p) => {
-            const defenderArmy = players[p.defenderIndex].army || 0;
-            const { attLeft, defLeft } = resolveBattle(p.sent, defenderArmy);
-            players[p.defenderIndex].army = defLeft;
-            syncCastleGarrison(p.defenderIndex);
-            if (attLeft > 0 && defLeft === 0) {
-              const victim = players[p.defenderIndex];
-              const stealMax = Math.floor(victim.gold * 0.10);
-              const loot = Math.min(stealMax, 150);
-              victim.gold -= loot; players[ai.index].gold += loot;
-              sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, ai.index);
-            }
-          }
-        });
-      } else {
-        // 45% chance: attack a random farm
-        const farmKeys = Array.from(farmsMap.keys());
-        if (farmKeys.length === 0) return;
-        const key = farmKeys[Math.floor(Math.random() * farmKeys.length)];
-        const [fx, fy] = key.split(',').map(Number);
-        sendTroops(ai.x, ai.y, fx, fy, null, {
-          ownerIndex: ai.index,
-          payload: { key, ownerIndex: ai.index, ownerLabel: ai.label, troops: send },
+          payload: { key: farmTarget.key, ownerIndex: ai.index, ownerLabel: ai.label, troops: sendFarm },
           onArrival: (p) => {
             const existing = farmOwners.get(p.key);
             if (existing && existing.ownerIndex !== p.ownerIndex) {
@@ -1150,18 +1390,74 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
               farmOwners.set(p.key, rec);
             }
             updateFarmVisual(p.key);
-            players[ai.index] = ai;
-            const lf = countFarmsOwned(0);
-            farmsText.textContent = lf;
-            {
-              const gross = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
-              const expense = estimateAutoHireCostPerMin(players[0]);
-              const net = Math.max(0, Math.floor(gross - expense));
-              incomeText.textContent = net;
+          }
+        });
+        return;
+      }
+
+      //    c) If farm not possible, try a castle raid vs rich & weak
+      const raid = pickBestCastleRaid(ai);
+      if (raid && ai.army > raid.def) {
+        const needRaid = Math.min(ai.army, Math.max(1, raid.def + 1));
+        const sendRaid = Math.max(1, Math.min(send, needRaid));
+        ai.army -= sendRaid;
+        if (ai._armyByType) {
+          const take = Math.min(sendRaid, ai._armyByType.militia || 0);
+          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+        }
+        syncCastleGarrison(ai.index);
+        sendTroops(ai.x, ai.y, raid.cx, raid.cy, null, {
+          ownerIndex: ai.index,
+          payload: { key: `${raid.cx},${raid.cy}`, defenderIndex: raid.defenderIndex, sent: sendRaid, attackerIndex: ai.index, originX: ai.x, originY: ai.y, targetX: raid.cx, targetY: raid.cy },
+          onArrival: (p) => {
+            const defenderArmy = players[p.defenderIndex].army || 0;
+            const { attLeft, defLeft } = resolveBattle(p.sent, defenderArmy);
+            players[p.defenderIndex].army = defLeft;
+            syncCastleGarrison(p.defenderIndex);
+            if (attLeft > 0 && defLeft === 0) {
+              const victim = players[p.defenderIndex];
+              const stealMax = Math.floor(victim.gold * 0.10);
+              const loot = Math.min(stealMax, 150);
+              victim.gold -= loot; players[ai.index].gold += loot;
+              sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, ai.index);
             }
           }
         });
+        return;
       }
+
+      //    d) If none viable, and we can make a serious push on center (even if not urgent), try it
+      if (canTakeCenter(ai, send)) {
+        ai.army -= send;
+        if (ai._armyByType) {
+          const take = Math.min(send, ai._armyByType.militia || 0);
+          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+        }
+        syncCastleGarrison(ai.index);
+        sendTroops(ai.x, ai.y, 50, 50, null, {
+          ownerIndex: ai.index,
+          payload: { sent: send, attackerIndex: ai.index },
+          onArrival: (p) => {
+            if (centralOwnerIndex === null) {
+              const before = centerDefense;
+              const { attLeft, defLeft } = resolveBattle(p.sent, before);
+              centerDefense = defLeft;
+              grantCenterGuardReward(p.attackerIndex, before, centerDefense);
+              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
+            } else if (centralOwnerIndex === p.attackerIndex) {
+              centralGarrison += p.sent;
+            } else {
+              const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
+              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
+              else { centralGarrison = defLeft; }
+            }
+            updateCenterVisual();
+          }
+        });
+        return;
+      }
+
+      //    e) Otherwise, hold — let income/auto-hire stack for a stronger push next cycle
     }
 
     // Run AI for players 2..8 with jittered schedule (6–12s between actions)
