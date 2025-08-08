@@ -598,17 +598,42 @@
       return n;
     }
 
-    // Estimate expected auto-hire spend per minute using per-type army structure
+    // Estimate expected auto-hire spend per minute using per-type army structure (floored for UI)
     function estimateAutoHireCostPerMin(player) {
       if (!player) return 0;
       if (!player._armyByType) player._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
       let spend = 0;
-      for (const [type, cost] of Object.entries(autoHireRatesPerMin)) {
+      for (const [type, rate] of Object.entries(autoHireRatesPerMin)) {
         const qty = player._armyByType[type] || 0;
-        spend += cost * qty;
+        spend += rate * qty;
       }
-      // Part 1.2 — floor to integer for UI (always down)
+      // For UI: always floor to integer
       return Math.floor(spend);
+    }
+
+    // Raw upkeep per minute (no flooring) for simulation logic (precise)
+    function upkeepPerMinRaw(player) {
+      if (!player) return 0;
+      if (!player._armyByType) player._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
+      let sum = 0;
+      for (const [type, rate] of Object.entries(autoHireRatesPerMin)) {
+        const qty = player._armyByType[type] || 0;
+        sum += rate * qty;
+      }
+      return sum;
+    }
+
+    // Calculate gross, upkeep, and net income per minute for a player
+    function calculateNetIncome(player) {
+      const farmsOwned = countFarmsOwned(player.index);
+      const hasCenter = (centralOwnerIndex === player.index) ? 200 : 0;
+      const grossIncome = 60 + farmsOwned * 30 + hasCenter;
+      const totalUpkeep = upkeepPerMinRaw(player);
+      const netIncome = grossIncome - totalUpkeep;
+      player.grossIncome = grossIncome;
+      player.totalUpkeep = totalUpkeep;
+      player.netIncome = netIncome;
+      return netIncome;
     }
 
     function fmtTime(s) {
@@ -769,22 +794,23 @@
       }
     } catch {}
 
-    // Continuous per-second income with integer gold increases
+    // Continuous per-second income with upkeep applied to gold (using net income)
     players.forEach(p => p._goldAcc = 0);
     let _lastTs = performance.now();
     let _autoHireAcc = 0; // seconds accumulator for auto-hiring per minute
     function mainLoop(ts) {
       const dt = Math.max(0, (ts - _lastTs) / 1000) * Math.max(1, gameSpeed);
       _lastTs = ts;
-      // per-player income accumulation
+      // Per-player income accumulation (net income: gross - upkeep)
       players.forEach((p) => {
-        const farmsOwned = countFarmsOwned(p.index);
-        const hasCenter = (centralOwnerIndex === p.index) ? 200 : 0;
-        const incomePerMin = 60 + farmsOwned * 30 + hasCenter; // +200 if owns center
-        const incomePerSec = incomePerMin / 60;
-        p._goldAcc += incomePerSec * dt;
-        if (p._goldAcc >= 1) {
-          const whole = Math.floor(p._goldAcc);
+        // Recalculate incomes and upkeep before gold is added
+        calculateNetIncome(p);
+        // Apply net income (can be negative)
+        const netIncomePerSec = p.netIncome / 60;
+        p._goldAcc += netIncomePerSec * dt;
+        // Integer gold payout
+        if (p._goldAcc >= 1 || p._goldAcc <= -1) {
+          const whole = p._goldAcc > 0 ? Math.floor(p._goldAcc) : Math.ceil(p._goldAcc);
           p._goldAcc -= whole;
           p.gold += whole;
           if (p.index === 0) {
@@ -792,15 +818,17 @@
             goldText.textContent = Math.floor(gold);
           }
         }
+        // Update local player UI
         if (p.index === 0) {
+          const farmsOwned = countFarmsOwned(0);
           farmsText.textContent = farmsOwned;
-          const gross = 60 + farmsOwned * 30 + (centralOwnerIndex === 0 ? 200 : 0);
-          const expense = estimateAutoHireCostPerMin(players[0]);
-          const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
+          const gross = p.grossIncome;
+          const expense = p.totalUpkeep;
+          const incomeVal = _showNet ? Math.floor(gross - expense) : Math.floor(gross);
           incomeText.textContent = incomeVal;
         }
       });
-      // Center reward pool accumulation (per second). When owned, pay owner directly per second.
+      // Center reward pool accumulation (per second). When owned, pool stops growing and owner income is already accounted for in per-minute income (hasCenter +200)
       _centerPoolAcc += dt;
       const perSecPool = CENTER_POOL_RATE_PER_MIN / 60;
       if (centralOwnerIndex === null) {
@@ -808,14 +836,7 @@
         // Throttle pool text updates to ~2Hz to avoid layout thrash
         if (_centerPoolAcc >= 0.5) { updateCenterVisual(); _centerPoolAcc = 0; }
       } else {
-        const owner = players[centralOwnerIndex];
-        if (owner) {
-          owner.gold += perSecPool * dt;
-          if (centralOwnerIndex === 0) {
-            gold = owner.gold;
-            goldText.textContent = Math.floor(gold);
-          }
-        }
+        // When owned, pool stops growing and owner income is already accounted for in per-minute income (hasCenter +200)
         _centerPoolAcc = 0; // no UI updates for pool when owned
       }
       // Auto-hiring update (run once per minute, catch up if tab was inactive)
@@ -1019,6 +1040,8 @@
       if (!playerListEl) return;
       const frag = document.createDocumentFragment();
       [...players].sort((a,b)=> b.gold - a.gold).forEach((p) => {
+        // Ensure incomes are up-to-date (in case not updated this frame)
+        calculateNetIncome(p);
         const row = document.createElement('div');
         row.className = 'player-row';
 
@@ -1038,16 +1061,16 @@
         meta.append(win, dot, name);
 
         // middle: live income per minute (net: gross income minus auto-hire estimate)
-        const farmsOwned = countFarmsOwned(p.index);
-        const hasCenter = (centralOwnerIndex === p.index) ? 200 : 0;
-        const gross = 60 + farmsOwned * 30 + hasCenter;
-        const expense = estimateAutoHireCostPerMin(p);
-        const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
+        const gross = p.grossIncome || 0;
+        const expense = p.totalUpkeep || 0;
+        // For UI: always floor net income (down), and do not display negative values
+        const net = Math.floor(gross - expense);
+        const incomeVal = _showNet ? Math.max(0, net) : Math.floor(gross);
         const incomeEl = document.createElement('div');
         incomeEl.className = 'player-income';
         incomeEl.innerHTML = `${incomeVal}<small>/min</small>`;
         incomeEl.title = _showNet
-          ? `Income: ${Math.floor(gross)}/min\nAuto-hire: -${Math.floor(expense)}/min\nNet: ${incomeVal}/min`
+          ? `Income: ${Math.floor(gross)}/min\nUpkeep: -${Math.floor(expense)}/min\nNet: ${net}/min`
           : `Gross income: ${Math.floor(gross)}/min`;
 
         // right: current gold
