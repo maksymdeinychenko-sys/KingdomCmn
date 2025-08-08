@@ -162,6 +162,10 @@
       <div>Farms: <span id="farms">0</span></div>
       <div>Income: <span id="income">10</span>/min <button id="toggle-net" class="tiny-btn">NET</button></div>
       <div><button id="toggle-autohire" class="tiny-btn on">Auto-hire: ON</button></div>
+      <div style="margin-top:6px; display:flex; align-items:center; gap:8px;">
+        <div>Game Speed: <span id="speed-label">x1</span></div>
+        <input id="speed-slider" type="range" min="1" max="10" step="1" value="1" style="width:140px;" />
+      </div>
     </div>
     <details id="sidebar" open>
       <summary>
@@ -224,13 +228,16 @@
     const LOOT_MAX_PCT = 0.30;   // 30%
     const RICH_GOLD_THRESHOLD = 800; // when an opponent is "rich", bots will also harass their farms
 
+    // If a bot can inflict >=1% damage to the central castle this push, use this base chance to prefer a center push
+    const CENTER_ONEPUSH_CHANCE = 0.7; // 70% base chance (can be overridden per profile)
+
     function calcRandomLoot(amount) {
       const pct = LOOT_MIN_PCT + Math.random() * (LOOT_MAX_PCT - LOOT_MIN_PCT);
       return Math.max(1, Math.floor(amount * pct));
     }
 
     // Central Castle ownership model
-    let centerDefenseMax = 1000;         // maximum neutral defenders
+    let centerDefenseMax = 333;         // maximum neutral defenders
     let centerDefense = centerDefenseMax; // current neutral defenders until captured
     let centralOwnerIndex = null;        // null => neutral
     let centralGarrison = 0;             // troops stationed if owned
@@ -239,7 +246,7 @@
     const centerDamageProgress = new Map(); // attackerIndex -> last whole percent rewarded
     // Dynamic reward pool for attacking/capturing the center
     const CENTER_POOL_RATE_PER_MIN = 200; // how fast the pool grows while neutral (gold per minute)
-    const CENTER_POOL_START = 10000;          // starting pool when neutral at game start
+    const CENTER_POOL_START = 20000;          // starting pool when neutral at game start
     let centerRewardPool = CENTER_POOL_START; // current pool
     let _centerPoolAcc = 0;               // small accumulator for throttling UI refresh
 
@@ -305,23 +312,29 @@
     function createAIProfile() {
       const roll = Math.random();
       if (roll < 0.25) {
-        // Hoarder: 
+        // Hoarder:
         return {
           name: 'Hoarder',
           actionDelayMin: 9000,
           actionDelayMax: 14000,
           sendFracMin: 0.20,
           sendFracMax: 0.40,
-          urgentBoost: 1.4,      // 
-          recallChance: 0.45,    //
+          urgentBoost: 1.4,
+          recallChance: 0.45,
           recallThreshold: 8,
           recallMaxFarms: 3,
-          centerAggression: 1.1,
+          centerAggression: 1.2,
           farmBias: 1.0,
-          raidBias: 0.9
+          raidBias: 0.9,
+          centerPushChance: 0.65,
+          percentDecisionChance: 0.80,
+          sendPercentMin: 0.25,
+          sendPercentMax: 0.50,
+          keepBackMin: 0.30,
+          multiActCap: 2
         };
       } else if (roll < 0.5) {
-        // Skirmisher: 
+        // Skirmisher:
         return {
           name: 'Skirmisher',
           actionDelayMin: 4000,
@@ -332,12 +345,18 @@
           recallChance: 0.20,
           recallThreshold: 6,
           recallMaxFarms: 1,
-          centerAggression: 0.9,
+          centerAggression: 1.0,
           farmBias: 1.2,
-          raidBias: 1.1
+          raidBias: 1.1,
+          centerPushChance: 0.55,
+          percentDecisionChance: 0.50,
+          sendPercentMin: 0.10,
+          sendPercentMax: 0.30,
+          keepBackMin: 0.15,
+          multiActCap: 3
         };
       } else if (roll < 0.75) {
-        // Opportunist: 
+        // Opportunist:
         return {
           name: 'Opportunist',
           actionDelayMin: 6000,
@@ -348,9 +367,15 @@
           recallChance: 0.30,
           recallThreshold: 7,
           recallMaxFarms: 2,
-          centerAggression: 1.3,
+          centerAggression: 1.5,
           farmBias: 1.1,
-          raidBias: 1.0
+          raidBias: 1.0,
+          centerPushChance: 0.85,
+          percentDecisionChance: 0.70,
+          sendPercentMin: 0.20,
+          sendPercentMax: 0.45,
+          keepBackMin: 0.25,
+          multiActCap: 3
         };
       }
       // Balanced (fallback)
@@ -364,9 +389,15 @@
         recallChance: 0.25,
         recallThreshold: 8,
         recallMaxFarms: 2,
-        centerAggression: 1.0,
+        centerAggression: 1.2,
         farmBias: 1.0,
-        raidBias: 1.0
+        raidBias: 1.0,
+        centerPushChance: 0.7,
+        percentDecisionChance: 0.60,
+        sendPercentMin: 0.15,
+        sendPercentMax: 0.40,
+        keepBackMin: 0.20,
+        multiActCap: 2
       };
     }
 
@@ -596,7 +627,7 @@
     let _lastTs = performance.now();
     let _autoHireAcc = 0; // seconds accumulator for auto-hiring per minute
     function mainLoop(ts) {
-      const dt = Math.max(0, (ts - _lastTs) / 1000);
+      const dt = Math.max(0, (ts - _lastTs) / 1000) * Math.max(1, gameSpeed);
       _lastTs = ts;
       // per-player income accumulation
       players.forEach((p) => {
@@ -682,6 +713,31 @@
         incomeText.textContent = incomeVal;
         // Refresh sidebar
         renderPlayerSidebar();
+      };
+    }
+
+    // --- Game Speed (x1..x10) ---
+    let gameSpeed = 1;
+    try {
+      const savedGS = localStorage.getItem('gameSpeed');
+      if (savedGS !== null) gameSpeed = Math.min(10, Math.max(1, parseInt(savedGS)));
+    } catch {}
+
+    const speedSlider = document.getElementById('speed-slider');
+    const speedLabel  = document.getElementById('speed-label');
+    function refreshSpeedUI() {
+      if (speedLabel) speedLabel.textContent = `x${gameSpeed}`;
+      if (speedSlider) speedSlider.value = String(gameSpeed);
+    }
+    refreshSpeedUI();
+
+    if (speedSlider) {
+      speedSlider.oninput = () => {
+        const v = parseInt(speedSlider.value);
+        gameSpeed = Math.min(10, Math.max(1, v));
+        refreshSpeedUI();
+        try { localStorage.setItem('gameSpeed', String(gameSpeed)); } catch {}
+        showToast(`Speed: x${gameSpeed}`);
       };
     }
 
@@ -935,7 +991,7 @@
       const dy = toY - fromY;
       const distance = Math.sqrt(dx * dx + dy * dy);
       const fullDistance = Math.sqrt(100 * 100 + 100 * 100);
-      const travelDuration = durationSeconds ?? (distance / fullDistance) * 60; // seconds
+      const travelDuration = (durationSeconds ?? (distance / fullDistance) * 60) / Math.max(1, gameSpeed); // seconds, scaled by speed
       const travelMillis = travelDuration * 1000;
 
       // Visual icon for everyone
@@ -1420,32 +1476,62 @@
 
     function scoreCenter(ai, send) {
       const timeLeftMin = Math.max(0, matchTimeLeft / 60);
-      const penalty = travelPenalty(ai.x, ai.y, 50, 50) * 0.5; // center is strategically important → distance hurts less
+      const penalty = travelPenalty(ai.x, ai.y, 50, 50) * 0.4; // center: distance matters even less
       let score = -Infinity;
 
       if (centralOwnerIndex === null) {
-        // Neutral: reward for damage (per full percent crossed)
-        const potentialDamage = Math.min(send, centerDefense);
-        const steps = Math.floor(potentialDamage / (centerDefenseMax / 100));
-        const reward = steps * CENTER_REWARD_PER_PERCENT;
+        // Neutral: only consider center if we can cross at least one full 1% threshold this push
+        const pctPerStep = centerDefenseMax / 100;
+        if (send < pctPerStep) return -Infinity;
+        // We can earn pool by dealing damage in 1% steps, even if we don't capture
+        const dmg = Math.min(send, centerDefense);
+        const steps = Math.floor(dmg / pctPerStep); // whole percents we likely cross
+
+        // Expected award from pool slices: each step pays ~1% of *current* pool.
+        // We discount by 0.7 to be conservative (pool shrinks as we take multiple steps in one strike).
+        const expectedPoolAward = Math.floor((centerRewardPool * 0.01) * steps * 0.7);
+
+        // Additional fixed reward per step from design (kept for tactical incentive)
+        const fixedPerStep = CENTER_REWARD_PER_PERCENT;
+        const fixedReward = steps * fixedPerStep;
+
+        // Low-guard bonus to finish
         let bonus = 0;
-        if (centerDefense < 400) bonus += 800; // low guard → extra attractive
-        // Only include centerRewardPool if neutral
-        let poolAdd = (centralOwnerIndex === null ? (send > centerDefense ? Math.floor(centerRewardPool) : 0) : 0);
-        score = reward + bonus + poolAdd - penalty;
+        if (centerDefense < 600) bonus += 400;
+        if (centerDefense < 300) bonus += 900;
+
+        // If the pool is large, strongly prefer center
+        const poolBoost = Math.min(2000, Math.floor(centerRewardPool * 0.15));
+
+        // If we can capture on this push, also add the remaining pool
+        const capturePool = (send > centerDefense ? Math.floor(centerRewardPool) : 0);
+
+        score = expectedPoolAward + fixedReward + bonus + poolBoost + capturePool - penalty;
       } else if (centralOwnerIndex !== ai.index) {
-        // Owned by someone else: value is +200/min for remaining time if we can capture now
-        if (send > centralGarrison) {
-          let value = 200 * timeLeftMin;
-          if (centralGarrison < 200) value += 1200; // thin garrison → big opportunity
-          // Only add centerRewardPool if center is neutral (should not happen here, but for safety)
-          value += (centralOwnerIndex === null ? Math.floor(centerRewardPool) : 0);
-          score = value - penalty;
+        // Center owned by someone: only consider if we can breach at least 1% of defense
+        const pctPerStep = centerDefenseMax / 100;
+        if (send < pctPerStep) return -Infinity;
+
+        // Score similar to a high-income farm, but add center's flat +200/min to owner income
+        const owner = players[centralOwnerIndex];
+        // Use the income as if the owner is earning +200/min from the center
+        // Use playerIncomes if available, else estimate (farms owned * 10 + 30 + 200)
+        let ownerIncome = 0;
+        if (typeof playerIncomes !== 'undefined' && playerIncomes[centralOwnerIndex] !== undefined) {
+          ownerIncome = playerIncomes[centralOwnerIndex] + 200;
+        } else {
+          // Estimate gross income
+          const farmsOwned = countFarmsOwned(centralOwnerIndex);
+          ownerIncome = 30 + farmsOwned * 10 + 200;
         }
+        const ownerGold = owner.gold || 0;
+        const potential = ownerIncome * 5 + ownerGold; // arbitrary scaling
+        score += potential;
+        score -= penalty;
       }
 
       // Endgame push: last 3 minutes → center becomes even more desirable
-      if (matchTimeLeft <= 180 && score > -Infinity) score *= 1.4;
+      if (matchTimeLeft <= 180 && score > -Infinity) score *= 1.5;
       return score;
     }
 
@@ -1461,6 +1547,18 @@
       // Softness bonus: the fewer defenders, the more attractive (0..180)
       const softness = Math.max(0, 6 - def) * 30;
       return incomeGain + neutralBonus + softness - penalty;
+    }
+
+    // Decide how many actions a bot can do in one tick (multi-action)
+    function computeAIMaxActions(ai) {
+      // Base 1 action; grant extra for having sizable army and spare gold
+      let acts = 1;
+      if ((ai.army || 0) >= 8) acts += 1;       // medium stack
+      if ((ai.army || 0) >= 20) acts += 1;      // large stack
+      if ((ai.gold  || 0) >= 300) acts += 1;    // spare gold for re-buys
+      // Cap by profile (defaults to 2)
+      const cap = (ai.aiProfile && ai.aiProfile.multiActCap) ? ai.aiProfile.multiActCap : 2;
+      return Math.min(acts, cap);
     }
 
     // --- Simple AI ---
@@ -1483,194 +1581,247 @@
         ai._armyByType.militia += toBuy;
       }
 
-      // 3) Decide send fraction based on time pressure — per profile
-      const urgent = (matchTimeLeft <= 120); // last 2 minutes
-      const baseFrac = prof.sendFracMin + Math.random() * (prof.sendFracMax - prof.sendFracMin);
-      const frac = urgent ? Math.min(0.9, baseFrac * prof.urgentBoost) : baseFrac;
-      let send = Math.max(1, Math.floor(ai.army * frac));
-      if (send <= 0) return;
+      // Multi-action core: attempt up to N actions this tick
+      function attemptOneAction() {
+        // 3) Decide send fraction based on time pressure — per profile
+        const urgent = (matchTimeLeft <= 120); // last 2 minutes
+        const baseFrac = prof.sendFracMin + Math.random() * (prof.sendFracMax - prof.sendFracMin);
+        const frac = urgent ? Math.min(0.9, baseFrac * prof.urgentBoost) : baseFrac;
+        let send = Math.max(1, Math.floor(ai.army * frac));
+        if (send <= 0) return false;
 
-      // 4) Priorities by expected value vs difficulty
-      const farmTarget = pickBestFarmTarget(ai);
-      let farmDecision = { score: -Infinity, amount: 0 };
-      if (farmTarget && ai.army > farmTarget.def) {
-        const need = Math.min(ai.army, Math.max(1, farmTarget.def + 1));
-        const sendFarm = Math.max(1, Math.min(send, need));
-        const s = scoreFarm(ai, farmTarget, sendFarm) * (prof.farmBias || 1);
-        farmDecision = { score: s, amount: sendFarm };
-      }
-
-      const centerScore = scoreCenter(ai, send) * (prof.centerAggression || 1);
-
-      // Choose higher score among center and farm; if both are poor, we'll consider a raid next
-      if (centerScore > farmDecision.score && centerScore > 0) {
-        // Attack center with `send`
-        ai.army -= send;
-        if (ai._armyByType) {
-          const take = Math.min(send, ai._armyByType.militia || 0);
-          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
-        }
-        syncCastleGarrison(ai.index);
-        sendTroops(ai.x, ai.y, 50, 50, null, {
-          ownerIndex: ai.index,
-          payload: { sent: send, attackerIndex: ai.index },
-          onArrival: (p) => {
-            if (centralOwnerIndex === null) {
-              const before = centerDefense;
-              const { attLeft, defLeft } = resolveBattle(p.sent, before);
-              centerDefense = defLeft;
-              grantCenterGuardReward(p.attackerIndex, before, centerDefense);
-              if (attLeft > 0 && defLeft === 0) {
-                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
-                // Award dynamic pool to the captor
-                if (centerRewardPool > 0) {
-                  const award = Math.floor(centerRewardPool);
-                  players[p.attackerIndex].gold += award;
-                  centerRewardPool = 0;
-                  updateCenterVisual();
-                }
-              }
-            } else if (centralOwnerIndex === p.attackerIndex) {
-              centralGarrison += p.sent;
-            } else {
-              const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
-              if (attLeft > 0 && defLeft === 0) {
-                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
-                // Award dynamic pool to the captor
-                if (centerRewardPool > 0) {
-                  const award = Math.floor(centerRewardPool);
-                  players[p.attackerIndex].gold += award;
-                  centerRewardPool = 0;
-                  updateCenterVisual();
-                }
-              }
-              else { centralGarrison = defLeft; }
-            }
-            updateCenterVisual();
+        // Percent-based send override (per profile): sometimes pick a random % of current garrison
+        if (Math.random() < (prof.percentDecisionChance || 0)) {
+          const minP = Math.max(0.01, Math.min(0.99, prof.sendPercentMin || 0.01));
+          const maxP = Math.max(minP, Math.min(0.99, prof.sendPercentMax || 0.50));
+          const keepP = Math.max(0, Math.min(0.95, prof.keepBackMin || 0));
+          const pct = minP + Math.random() * (maxP - minP);
+          const keep = Math.floor(ai.army * keepP);
+          const desired = Math.max(1, Math.floor(ai.army * pct));
+          const cap = Math.max(0, ai.army - keep);
+          const finalSend = Math.min(desired, cap);
+          if (finalSend >= 1) {
+            send = finalSend; // use the percent-based decision for this action
+          } else {
+            return false; // too small due to keep-back
           }
-        });
-        return;
-      }
-
-      if (farmDecision.score > 0) {
-        const sendFarm = farmDecision.amount;
-        ai.army -= sendFarm;
-        if (ai._armyByType) {
-          const take = Math.min(sendFarm, ai._armyByType.militia || 0);
-          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
         }
-        syncCastleGarrison(ai.index);
-        sendTroops(ai.x, ai.y, farmTarget.fx, farmTarget.fy, null, {
-          ownerIndex: ai.index,
-          payload: { key: farmTarget.key, ownerIndex: ai.index, ownerLabel: ai.label, troops: sendFarm },
-          onArrival: (p) => {
-            const existing = farmOwners.get(p.key);
-            if (existing && existing.ownerIndex !== p.ownerIndex) {
-              const { attLeft, defLeft } = resolveBattle(p.troops, existing.troops);
-              if (attLeft > 0) {
-                farmOwners.set(p.key, { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: attLeft });
+
+        // 4) Priorities by expected value vs difficulty
+        const farmTarget = pickBestFarmTarget(ai);
+        let farmDecision = { score: -Infinity, amount: 0 };
+        if (farmTarget && ai.army > farmTarget.def) {
+          const need = Math.min(ai.army, Math.max(1, farmTarget.def + 1));
+          const sendFarm = Math.max(1, Math.min(send, need));
+          const s = scoreFarm(ai, farmTarget, sendFarm) * (prof.farmBias || 1);
+          farmDecision = { score: s, amount: sendFarm };
+        }
+
+        const centerScore = scoreCenter(ai, send) * (prof.centerAggression || 1);
+
+        // Choose higher score among center and farm; center must beat farm by 20% to take priority
+        let preferCenter = (centerScore > 0) && (centerScore >= farmDecision.score * 1.20);
+
+        // Probabilistic override: if we can cross at least 1% this push, allow center with high chance even if farm is slightly better
+        const pctPerStep = centerDefenseMax / 100;
+        const canOnePercent = (centralOwnerIndex === null)
+          ? (send >= pctPerStep)
+          : (centralOwnerIndex !== ai.index && send >= pctPerStep);
+        const pushChance = (ai.aiProfile && typeof ai.aiProfile.centerPushChance === 'number')
+          ? ai.aiProfile.centerPushChance
+          : CENTER_ONEPUSH_CHANCE;
+
+        if (!preferCenter && centerScore > 0 && canOnePercent) {
+          // If center is within 30% of farm score, roll the dice to push center
+          const within = centerScore >= farmDecision.score * 0.70;
+          if (within && Math.random() < pushChance) {
+            preferCenter = true;
+          }
+        }
+
+        if (preferCenter) {
+          // If we are short for capture (vs guard/garrison), try a quick rally (recall) and wait a cycle
+          const needForNeutral = Math.max(0, centerDefense + 1);
+          const needForOwned   = Math.max(0, centralGarrison + 1);
+          const need = (centralOwnerIndex === null) ? needForNeutral : (centralOwnerIndex === ai.index ? 0 : needForOwned);
+          if (need > 0 && send < need) {
+            const recalledNow = aiRecallFromFarms(ai, prof.recallThreshold || 8, Math.max(1, prof.recallMaxFarms || 2));
+            if (recalledNow > 0) return true; // we "did" an action: rallied; end this attempt
+          }
+
+          // Attack center with `send`
+          ai.army -= send;
+          if (ai._armyByType) {
+            const take = Math.min(send, ai._armyByType.militia || 0);
+            ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+          }
+          syncCastleGarrison(ai.index);
+          sendTroops(ai.x, ai.y, 50, 50, null, {
+            ownerIndex: ai.index,
+            payload: { sent: send, attackerIndex: ai.index },
+            onArrival: (p) => {
+              if (centralOwnerIndex === null) {
+                const before = centerDefense;
+                const { attLeft, defLeft } = resolveBattle(p.sent, before);
+                centerDefense = defLeft;
+                grantCenterGuardReward(p.attackerIndex, before, centerDefense);
+                if (attLeft > 0 && defLeft === 0) {
+                  centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                  if (centerRewardPool > 0) {
+                    const award = Math.floor(centerRewardPool);
+                    players[p.attackerIndex].gold += award;
+                    centerRewardPool = 0;
+                    updateCenterVisual();
+                  }
+                }
+              } else if (centralOwnerIndex === p.attackerIndex) {
+                centralGarrison += p.sent;
               } else {
-                farmOwners.set(p.key, { ownerIndex: existing.ownerIndex, ownerLabel: existing.ownerLabel, troops: defLeft });
-              }
-            } else {
-              const rec = existing || { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: 0 };
-              rec.ownerIndex = p.ownerIndex; rec.ownerLabel = p.ownerLabel; rec.troops += p.troops;
-              farmOwners.set(p.key, rec);
-            }
-            updateFarmVisual(p.key);
-          }
-        });
-        return;
-      }
-
-      //    c) If farm not possible, try a castle raid vs rich & weak
-      const raid = pickBestCastleRaid(ai);
-      if (raid && ai.army > raid.def) {
-        const needRaid = Math.min(ai.army, Math.max(1, raid.def + 1));
-        const sendRaid = Math.max(1, Math.min(send, needRaid));
-        ai.army -= sendRaid;
-        if (ai._armyByType) {
-          const take = Math.min(sendRaid, ai._armyByType.militia || 0);
-          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
-        }
-        syncCastleGarrison(ai.index);
-        sendTroops(ai.x, ai.y, raid.cx, raid.cy, null, {
-          ownerIndex: ai.index,
-          payload: { key: `${raid.cx},${raid.cy}`, defenderIndex: raid.defenderIndex, sent: sendRaid, attackerIndex: ai.index, originX: ai.x, originY: ai.y, targetX: raid.cx, targetY: raid.cy },
-          onArrival: (p) => {
-            const defenderArmy = players[p.defenderIndex].army || 0;
-            const { attLeft, defLeft } = resolveBattle(p.sent, defenderArmy);
-            players[p.defenderIndex].army = defLeft;
-            syncCastleGarrison(p.defenderIndex);
-            if (attLeft > 0 && defLeft === 0) {
-              const victim = players[p.defenderIndex];
-              const loot = calcRandomLoot(victim.gold);
-              victim.gold = Math.max(0, victim.gold - loot);
-              players[ai.index].gold += loot;
-              sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, ai.index);
-            }
-          }
-        });
-        return;
-      }
-
-      //    d) If none viable, and we can make a serious push on center (even if not urgent), try it
-      if (canTakeCenter(ai, send)) {
-        ai.army -= send;
-        if (ai._armyByType) {
-          const take = Math.min(send, ai._armyByType.militia || 0);
-          ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
-        }
-        syncCastleGarrison(ai.index);
-        sendTroops(ai.x, ai.y, 50, 50, null, {
-          ownerIndex: ai.index,
-          payload: { sent: send, attackerIndex: ai.index },
-          onArrival: (p) => {
-            if (centralOwnerIndex === null) {
-              const before = centerDefense;
-              const { attLeft, defLeft } = resolveBattle(p.sent, before);
-              centerDefense = defLeft;
-              grantCenterGuardReward(p.attackerIndex, before, centerDefense);
-              if (attLeft > 0 && defLeft === 0) {
-                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
-                // Award dynamic pool to the captor
-                if (centerRewardPool > 0) {
-                  const award = Math.floor(centerRewardPool);
-                  players[p.attackerIndex].gold += award;
-                  centerRewardPool = 0;
-                  updateCenterVisual();
+                const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
+                if (attLeft > 0 && defLeft === 0) {
+                  centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                  if (centerRewardPool > 0) {
+                    const award = Math.floor(centerRewardPool);
+                    players[p.attackerIndex].gold += award;
+                    centerRewardPool = 0;
+                    updateCenterVisual();
+                  }
+                } else {
+                  centralGarrison = defLeft;
                 }
               }
-            } else if (centralOwnerIndex === p.attackerIndex) {
-              centralGarrison += p.sent;
-            } else {
-              const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
-              if (attLeft > 0 && defLeft === 0) {
-                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
-                // Award dynamic pool to the captor
-                if (centerRewardPool > 0) {
-                  const award = Math.floor(centerRewardPool);
-                  players[p.attackerIndex].gold += award;
-                  centerRewardPool = 0;
-                  updateCenterVisual();
-                }
-              }
-              else { centralGarrison = defLeft; }
+              updateCenterVisual();
             }
-            updateCenterVisual();
+          });
+          return true;
+        }
+
+        if (farmDecision.score > 0) {
+          const sendFarm = farmDecision.amount;
+          ai.army -= sendFarm;
+          if (ai._armyByType) {
+            const take = Math.min(sendFarm, ai._armyByType.militia || 0);
+            ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
           }
-        });
-        return;
+          syncCastleGarrison(ai.index);
+          sendTroops(ai.x, ai.y, farmTarget.fx, farmTarget.fy, null, {
+            ownerIndex: ai.index,
+            payload: { key: farmTarget.key, ownerIndex: ai.index, ownerLabel: ai.label, troops: sendFarm },
+            onArrival: (p) => {
+              const existing = farmOwners.get(p.key);
+              if (existing && existing.ownerIndex !== p.ownerIndex) {
+                const { attLeft, defLeft } = resolveBattle(p.troops, existing.troops);
+                if (attLeft > 0) {
+                  farmOwners.set(p.key, { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: attLeft });
+                } else {
+                  farmOwners.set(p.key, { ownerIndex: existing.ownerIndex, ownerLabel: existing.ownerLabel, troops: defLeft });
+                }
+              } else {
+                const rec = existing || { ownerIndex: p.ownerIndex, ownerLabel: p.ownerLabel, troops: 0 };
+                rec.ownerIndex = p.ownerIndex; rec.ownerLabel = p.ownerLabel; rec.troops += p.troops;
+                farmOwners.set(p.key, rec);
+              }
+              updateFarmVisual(p.key);
+            }
+          });
+          return true;
+        }
+
+        //    c) If farm not possible, try a castle raid vs rich & weak
+        const raid = pickBestCastleRaid(ai);
+        if (raid && ai.army > raid.def) {
+          const needRaid = Math.min(ai.army, Math.max(1, raid.def + 1));
+          const sendRaid = Math.max(1, Math.min(send, needRaid));
+          ai.army -= sendRaid;
+          if (ai._armyByType) {
+            const take = Math.min(sendRaid, ai._armyByType.militia || 0);
+            ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+          }
+          syncCastleGarrison(ai.index);
+          sendTroops(ai.x, ai.y, raid.cx, raid.cy, null, {
+            ownerIndex: ai.index,
+            payload: { key: `${raid.cx},${raid.cy}`, defenderIndex: raid.defenderIndex, sent: sendRaid, attackerIndex: ai.index, originX: ai.x, originY: ai.y, targetX: raid.cx, targetY: raid.cy },
+            onArrival: (p) => {
+              const defenderArmy = players[p.defenderIndex].army || 0;
+              const { attLeft, defLeft } = resolveBattle(p.sent, defenderArmy);
+              players[p.defenderIndex].army = defLeft;
+              syncCastleGarrison(p.defenderIndex);
+              if (attLeft > 0 && defLeft === 0) {
+                const victim = players[p.defenderIndex];
+                const loot = calcRandomLoot(victim.gold);
+                victim.gold = Math.max(0, victim.gold - loot);
+                players[ai.index].gold += loot;
+                sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, ai.index);
+              }
+            }
+          });
+          return true;
+        }
+
+        //    d) If none viable, and we can make a serious push on center (even if not urgent), try it
+        if (canTakeCenter(ai, send)) {
+          ai.army -= send;
+          if (ai._armyByType) {
+            const take = Math.min(send, ai._armyByType.militia || 0);
+            ai._armyByType.militia = Math.max(0, (ai._armyByType.militia || 0) - take);
+          }
+          syncCastleGarrison(ai.index);
+          sendTroops(ai.x, ai.y, 50, 50, null, {
+            ownerIndex: ai.index,
+            payload: { sent: send, attackerIndex: ai.index },
+            onArrival: (p) => {
+              if (centralOwnerIndex === null) {
+                const before = centerDefense;
+                const { attLeft, defLeft } = resolveBattle(p.sent, before);
+                centerDefense = defLeft;
+                grantCenterGuardReward(p.attackerIndex, before, centerDefense);
+                if (attLeft > 0 && defLeft === 0) {
+                  centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                  if (centerRewardPool > 0) {
+                    const award = Math.floor(centerRewardPool);
+                    players[p.attackerIndex].gold += award;
+                    centerRewardPool = 0;
+                    updateCenterVisual();
+                  }
+                }
+              } else if (centralOwnerIndex === p.attackerIndex) {
+                centralGarrison += p.sent;
+              } else {
+                const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
+                if (attLeft > 0 && defLeft === 0) {
+                  centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                  if (centerRewardPool > 0) {
+                    const award = Math.floor(centerRewardPool);
+                    players[p.attackerIndex].gold += award;
+                    centerRewardPool = 0;
+                    updateCenterVisual();
+                  }
+                }
+                else { centralGarrison = defLeft; }
+              }
+              updateCenterVisual();
+            }
+          });
+          return true;
+        }
+
+        //    e) Otherwise, hold — let income/auto-hire stack for a stronger push next cycle
+        return false;
       }
 
-      //    e) Otherwise, hold — let income/auto-hire stack for a stronger push next cycle
+      const maxActs = computeAIMaxActions(ai);
+      for (let step = 0; step < maxActs; step++) {
+        const did = attemptOneAction();
+        if (!did) break; // stop if no viable action this sub-step
+      }
     }
 
     // Run AI for players 2..8 with jittered schedule (per profile)
     function scheduleAI(ai) {
       const prof = ai.aiProfile || { actionDelayMin: 6000, actionDelayMax: 12000 };
       const span = Math.max(0, (prof.actionDelayMax - prof.actionDelayMin));
-      const delay = (prof.actionDelayMin || 6000) + Math.random() * span;
+      const baseDelay = (prof.actionDelayMin || 6000) + Math.random() * span;
+      const delay = Math.max(100, baseDelay / Math.max(1, gameSpeed)); // faster ticks at higher speed
       setTimeout(() => {
         aiHireAndAct(ai);
         scheduleAI(ai); // reschedule with new jitter per profile
