@@ -160,7 +160,7 @@
       <div>Gold: <span id="gold">500</span></div>
       <div>Army: <span id="army">0</span></div>
       <div>Farms: <span id="farms">0</span></div>
-      <div>Income: <span id="income">10</span>/min <button id="toggle-net" class="tiny-btn">NET</button></div>
+      <div>Income: <span id="income">60</span>/min <button id="toggle-net" class="tiny-btn">NET</button></div>
       <div><button id="toggle-autohire" class="tiny-btn on">Auto-hire: ON</button></div>
       <div style="margin-top:6px; display:flex; align-items:center; gap:8px;">
         <div>Game Speed: <span id="speed-label">x1</span></div>
@@ -209,10 +209,10 @@
 
     // --- Auto-hiring (per minute) rates ---
     const autoHireRatesPerMin = {
-      militia: 0.05,
-      infantry: 0.10,
-      archer: 0.10,
-      cavalry: 0.20,
+      militia: 0.10,
+      infantry: 0.20,
+      archer: 0.15,
+      cavalry: 0.40,
     };
 
     // --- Full unit purchase costs (used by auto-hire when buying) ---
@@ -226,7 +226,7 @@
     // --- Loot & targeting tuning ---
     const LOOT_MIN_PCT = 0.05;   // 5%
     const LOOT_MAX_PCT = 0.30;   // 30%
-    const RICH_GOLD_THRESHOLD = 800; // when an opponent is "rich", bots will also harass their farms
+    const RICH_GOLD_THRESHOLD = 600; // when an opponent is "rich", bots will also harass their farms
 
     // If a bot can inflict >=1% damage to the central castle this push, use this base chance to prefer a center push
     const CENTER_ONEPUSH_CHANCE = 0.7; // 70% base chance (can be overridden per profile)
@@ -633,7 +633,7 @@
       players.forEach((p) => {
         const farmsOwned = countFarmsOwned(p.index);
         const hasCenter = (centralOwnerIndex === p.index) ? 200 : 0;
-        const incomePerMin = 30 + farmsOwned * 10 + hasCenter; // +200 if owns center
+        const incomePerMin = 60 + farmsOwned * 30 + hasCenter; // +200 if owns center
         const incomePerSec = incomePerMin / 60;
         p._goldAcc += incomePerSec * dt;
         if (p._goldAcc >= 1) {
@@ -647,7 +647,7 @@
         }
         if (p.index === 0) {
           farmsText.textContent = farmsOwned;
-          const gross = 30 + farmsOwned * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+          const gross = 60 + farmsOwned * 30 + (centralOwnerIndex === 0 ? 200 : 0);
           const expense = estimateAutoHireCostPerMin(players[0]);
           const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
           incomeText.textContent = incomeVal;
@@ -707,7 +707,7 @@
         toggleNetBtn.textContent = _showNet ? 'NET' : 'GROSS';
         // Refresh HUD income immediately
         const farmsOwned = countFarmsOwned(0);
-        const gross = 30 + farmsOwned * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+        const gross = 60 + farmsOwned * 30 + (centralOwnerIndex === 0 ? 200 : 0);
         const expense = estimateAutoHireCostPerMin(players[0]);
         const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
         incomeText.textContent = incomeVal;
@@ -831,7 +831,7 @@
         // middle: live income per minute (net: gross income minus auto-hire estimate)
         const farmsOwned = countFarmsOwned(p.index);
         const hasCenter = (centralOwnerIndex === p.index) ? 200 : 0;
-        const gross = 30 + farmsOwned * 10 + hasCenter;
+        const gross = 60 + farmsOwned * 30 + hasCenter;
         const expense = estimateAutoHireCostPerMin(p);
         const incomeVal = _showNet ? Math.max(0, Math.floor(gross - expense)) : Math.floor(gross);
         const incomeEl = document.createElement('div');
@@ -1342,7 +1342,7 @@
                 const lf = countFarmsOwned(0);
                 farmsText.textContent = lf;
                 {
-                  const gross = 30 + lf * 10 + (centralOwnerIndex === 0 ? 200 : 0);
+                  const gross = 60 + lf * 30 + (centralOwnerIndex === 0 ? 200 : 0);
                   const expense = estimateAutoHireCostPerMin(players[0]);
                   const net = Math.max(0, Math.floor(gross - expense));
                   incomeText.textContent = net;
