@@ -219,6 +219,16 @@
       militia: 30,
     };
 
+    // --- Loot & targeting tuning ---
+    const LOOT_MIN_PCT = 0.05;   // 5%
+    const LOOT_MAX_PCT = 0.30;   // 30%
+    const RICH_GOLD_THRESHOLD = 800; // when an opponent is "rich", bots will also harass their farms
+
+    function calcRandomLoot(amount) {
+      const pct = LOOT_MIN_PCT + Math.random() * (LOOT_MAX_PCT - LOOT_MIN_PCT);
+      return Math.max(1, Math.floor(amount * pct));
+    }
+
     // Central Castle ownership model
     let centerDefenseMax = 1000;         // maximum neutral defenders
     let centerDefense = centerDefenseMax; // current neutral defenders until captured
@@ -227,12 +237,20 @@
     let centerElement = null;            // DOM element reference
     // Track per-attacker reward progress for neutral guard damage (percentage thresholds)
     const centerDamageProgress = new Map(); // attackerIndex -> last whole percent rewarded
+    // Dynamic reward pool for attacking/capturing the center
+    const CENTER_POOL_RATE_PER_MIN = 200; // how fast the pool grows while neutral (gold per minute)
+    const CENTER_POOL_START = 10000;          // starting pool when neutral at game start
+    let centerRewardPool = CENTER_POOL_START; // current pool
+    let _centerPoolAcc = 0;               // small accumulator for throttling UI refresh
+
+    // Reward per 1% neutral guard destroyed (tunable)
+    const CENTER_REWARD_PER_PERCENT = 300;
 
     function updateCenterVisual() {
       if (!centerElement) return;
       const span = centerElement.querySelector('span');
       if (centralOwnerIndex === null) {
-        if (span) span.innerHTML = `Central Castle — Guard: <img src="army-icon.png" class="army-glyph">${centerDefense}`;
+        if (span) span.innerHTML = `Central Castle — Guard: <img src="army-icon.png" class="army-glyph">${centerDefense} — Pool: ${Math.floor(centerRewardPool)}`;
         centerElement.classList.remove('owned');
         centerElement.style.outlineColor = '';
       } else {
@@ -283,6 +301,80 @@
       if (!p._armyByType) p._armyByType = { militia: 0, infantry: 0, archer: 0, cavalry: 0 };
     });
 
+    // --- AI Strategy Profiles ---
+    function createAIProfile() {
+      const roll = Math.random();
+      if (roll < 0.25) {
+        // Hoarder: 
+        return {
+          name: 'Hoarder',
+          actionDelayMin: 9000,
+          actionDelayMax: 14000,
+          sendFracMin: 0.20,
+          sendFracMax: 0.40,
+          urgentBoost: 1.4,      // 
+          recallChance: 0.45,    //
+          recallThreshold: 8,
+          recallMaxFarms: 3,
+          centerAggression: 1.1,
+          farmBias: 1.0,
+          raidBias: 0.9
+        };
+      } else if (roll < 0.5) {
+        // Skirmisher: 
+        return {
+          name: 'Skirmisher',
+          actionDelayMin: 4000,
+          actionDelayMax: 7000,
+          sendFracMin: 0.15,
+          sendFracMax: 0.35,
+          urgentBoost: 1.2,
+          recallChance: 0.20,
+          recallThreshold: 6,
+          recallMaxFarms: 1,
+          centerAggression: 0.9,
+          farmBias: 1.2,
+          raidBias: 1.1
+        };
+      } else if (roll < 0.75) {
+        // Opportunist: 
+        return {
+          name: 'Opportunist',
+          actionDelayMin: 6000,
+          actionDelayMax: 10000,
+          sendFracMin: 0.25,
+          sendFracMax: 0.50,
+          urgentBoost: 1.3,
+          recallChance: 0.30,
+          recallThreshold: 7,
+          recallMaxFarms: 2,
+          centerAggression: 1.3,
+          farmBias: 1.1,
+          raidBias: 1.0
+        };
+      }
+      // Balanced (fallback)
+      return {
+        name: 'Balanced',
+        actionDelayMin: 6000,
+        actionDelayMax: 12000,
+        sendFracMin: 0.25,
+        sendFracMax: 0.35,
+        urgentBoost: 1.2,
+        recallChance: 0.25,
+        recallThreshold: 8,
+        recallMaxFarms: 2,
+        centerAggression: 1.0,
+        farmBias: 1.0,
+        raidBias: 1.0
+      };
+    }
+
+    // Assign a random profile to every bot (players 2..8)
+    for (let i = 1; i < players.length; i++) {
+      players[i].aiProfile = createAIProfile();
+    }
+
     // Castle garrisons: key -> { ownerIndex, troops }
     const castleGarrisons = new Map();
     positions.forEach(([x, y], i) => {
@@ -297,7 +389,7 @@
       return { attLeft, defLeft };
     }
 
-    // Reward helper: grant 100 gold for each whole percent of neutral guard destroyed
+    // Reward helper: grant gold for each whole percent of neutral guard destroyed
     function grantCenterGuardReward(attackerIndex, beforeDef, afterDef) {
       if (attackerIndex == null) return;
       // Only while center is neutral (no owner)
@@ -305,16 +397,23 @@
       const prevPct = Math.floor(((centerDefenseMax - beforeDef) / centerDefenseMax) * 100);
       const newPct  = Math.floor(((centerDefenseMax - afterDef)  / centerDefenseMax) * 100);
       if (newPct > prevPct) {
-        const steps = newPct - prevPct;
-        const reward = steps * 100;
+        let steps = newPct - prevPct; // how many whole percents crossed this strike
         const p = players[attackerIndex];
-        p.gold += reward;
-        if (attackerIndex === 0) {
-          gold = p.gold; // sync local cache/UI
-          goldText.textContent = Math.floor(gold);
-          showToast(`+${reward} gold (castle damage)`);
-          // Optional: show a small popup for the local player:
-          // createInfoPopup(`Bonus for castle damage: +${reward} gold`);
+        let totalAward = 0;
+        while (steps-- > 0) {
+          const stepAward = Math.max(0, Math.floor(centerRewardPool * 0.01)); // 1% of CURRENT pool
+          if (stepAward > 0) {
+            totalAward += stepAward;
+            centerRewardPool = Math.max(0, centerRewardPool - stepAward);
+          }
+        }
+        if (totalAward > 0) {
+          p.gold += totalAward;
+          if (attackerIndex === 0) {
+            gold = p.gold; goldText.textContent = Math.floor(gold);
+            showToast(`+${totalAward} gold (center damage)`);
+          }
+          updateCenterVisual();
         }
       }
       // Record latest awarded percent for this attacker
@@ -388,6 +487,10 @@
       centralOwnerIndex = null;
       centralGarrison = 0;
       centerDamageProgress.clear();
+      updateCenterVisual();
+      // reset dynamic center reward pool
+      centerRewardPool = CENTER_POOL_START;
+      _centerPoolAcc = 0;
       updateCenterVisual();
 
       // sync castles
@@ -519,6 +622,24 @@
           incomeText.textContent = incomeVal;
         }
       });
+      // Center reward pool accumulation (per second). When owned, pay owner directly per second.
+      _centerPoolAcc += dt;
+      const perSecPool = CENTER_POOL_RATE_PER_MIN / 60;
+      if (centralOwnerIndex === null) {
+        centerRewardPool += perSecPool * dt;
+        // Throttle pool text updates to ~2Hz to avoid layout thrash
+        if (_centerPoolAcc >= 0.5) { updateCenterVisual(); _centerPoolAcc = 0; }
+      } else {
+        const owner = players[centralOwnerIndex];
+        if (owner) {
+          owner.gold += perSecPool * dt;
+          if (centralOwnerIndex === 0) {
+            gold = owner.gold;
+            goldText.textContent = Math.floor(gold);
+          }
+        }
+        _centerPoolAcc = 0; // no UI updates for pool when owned
+      }
       // Auto-hiring update (run once per minute, catch up if tab was inactive)
       _autoHireAcc += dt;
       if (_autoHireAcc >= 60) {
@@ -943,7 +1064,7 @@
     let localPlayerPos = { x: positions[0][0], y: positions[0][1] };
 
     // Center castle — capturable; owner gets +200/min
-centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + centerDefenseMax, () => {
+    centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + centerDefenseMax, () => {
       if (army > 0) {
         const b = ensureArmyBuckets(players[0]);
         createTroopPopup(["infantry", "archer", "cavalry", "militia"], {
@@ -969,6 +1090,17 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
                 if (attLeft > 0 && defLeft === 0) {
                   centralOwnerIndex = p.attackerIndex;
                   centralGarrison = attLeft; // survivors stay as central garrison
+                  // Award dynamic pool to the captor
+                  if (centerRewardPool > 0) {
+                    const award = Math.floor(centerRewardPool);
+                    players[p.attackerIndex].gold += award;
+                    if (p.attackerIndex === 0) {
+                      gold = players[0].gold; goldText.textContent = Math.floor(gold);
+                      showToast(`+${award} gold (center pool)`);
+                    }
+                    centerRewardPool = 0;
+                    updateCenterVisual();
+                  }
                 }
               } else if (centralOwnerIndex === p.attackerIndex) {
                 // reinforce own center
@@ -979,6 +1111,17 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
                 if (attLeft > 0 && defLeft === 0) {
                   centralOwnerIndex = p.attackerIndex;
                   centralGarrison = attLeft;
+                  // Award dynamic pool to the captor
+                  if (centerRewardPool > 0) {
+                    const award = Math.floor(centerRewardPool);
+                    players[p.attackerIndex].gold += award;
+                    if (p.attackerIndex === 0) {
+                      gold = players[0].gold; goldText.textContent = Math.floor(gold);
+                      showToast(`+${award} gold (center pool)`);
+                    }
+                    centerRewardPool = 0;
+                    updateCenterVisual();
+                  }
                 } else {
                   centralGarrison = defLeft;
                 }
@@ -1025,9 +1168,9 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
                   syncCastleGarrison(p.defenderIndex);
                   if (attLeft > 0 && defLeft === 0) {
                     const victim = players[p.defenderIndex];
-                    const stealMax = Math.floor(victim.gold * 0.10);
-                    const loot = Math.min(stealMax, 150);
-                    victim.gold -= loot; players[0].gold += loot; gold = players[0].gold; goldText.textContent = Math.floor(gold);
+                    const loot = calcRandomLoot(victim.gold);
+                    victim.gold = Math.max(0, victim.gold - loot);
+                    players[0].gold += loot; gold = players[0].gold; goldText.textContent = Math.floor(gold);
                     showToast(`Looted +${loot} gold`);
                     createInfoPopup(`Raid successful! Looted ${loot} gold from ${victim.label}.`);
                     // send survivors back to our castle with visible movement
@@ -1206,8 +1349,19 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
     // --- Smarter AI Planning Helpers ---
     function distSq(ax, ay, bx, by) { const dx = ax - bx, dy = ay - by; return dx*dx + dy*dy; }
 
+    function getRichOpponent(ai) {
+      let bestIdx = -1;
+      let bestGold = -1;
+      players.forEach((p) => {
+        if (p.index === ai.index) return;
+        if (p.gold > bestGold) { bestGold = p.gold; bestIdx = p.index; }
+      });
+      return { index: bestIdx, gold: Math.floor(Math.max(0, bestGold)) };
+    }
+
     function pickBestFarmTarget(ai) {
       // Prefer: neutral farms first; otherwise enemy farms with the fewest defenders.
+      const rich = getRichOpponent(ai);
       let best = null;
       farmsMap.forEach((_, key) => {
         const rec = farmOwners.get(key) || null;
@@ -1218,7 +1372,8 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
           if (!best || score > best.score) best = { type: 'neutral-farm', key, fx, fy, def: 0, score };
         } else if (rec.ownerIndex !== ai.index) {
           const def = rec.troops || 0;
-          const score = 50000 - def*5000 - distSq(ai.x, ai.y, fx, fy) * 0.5; // stronger penalty for defense, softer distance
+          const richBonus = (rich.index === rec.ownerIndex && rich.gold >= RICH_GOLD_THRESHOLD) ? 20000 : 0;
+          const score = 50000 - def*5000 - distSq(ai.x, ai.y, fx, fy) * 0.5 + richBonus; // harass rich opponents' farms
           if (!best || score > best.score) best = { type: 'enemy-farm', key, fx, fy, def, score };
         }
       });
@@ -1265,21 +1420,33 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
 
     function scoreCenter(ai, send) {
       const timeLeftMin = Math.max(0, matchTimeLeft / 60);
-      const penalty = travelPenalty(ai.x, ai.y, 50, 50);
+      const penalty = travelPenalty(ai.x, ai.y, 50, 50) * 0.5; // center is strategically important → distance hurts less
+      let score = -Infinity;
+
       if (centralOwnerIndex === null) {
-        // Neutral: reward is 100 gold per 1% guard destroyed. 1% of 1000 = 10 defenders.
+        // Neutral: reward for damage (per full percent crossed)
         const potentialDamage = Math.min(send, centerDefense);
-        const steps = Math.floor(potentialDamage / (centerDefenseMax / 100)); // how many whole percents we likely cross
-        const reward = steps * 100;
-        return reward - penalty;
+        const steps = Math.floor(potentialDamage / (centerDefenseMax / 100));
+        const reward = steps * CENTER_REWARD_PER_PERCENT;
+        let bonus = 0;
+        if (centerDefense < 400) bonus += 800; // low guard → extra attractive
+        // Only include centerRewardPool if neutral
+        let poolAdd = (centralOwnerIndex === null ? (send > centerDefense ? Math.floor(centerRewardPool) : 0) : 0);
+        score = reward + bonus + poolAdd - penalty;
+      } else if (centralOwnerIndex !== ai.index) {
+        // Owned by someone else: value is +200/min for remaining time if we can capture now
+        if (send > centralGarrison) {
+          let value = 200 * timeLeftMin;
+          if (centralGarrison < 200) value += 1200; // thin garrison → big opportunity
+          // Only add centerRewardPool if center is neutral (should not happen here, but for safety)
+          value += (centralOwnerIndex === null ? Math.floor(centerRewardPool) : 0);
+          score = value - penalty;
+        }
       }
-      if (centralOwnerIndex === ai.index) return -Infinity; // already ours, deprioritize here
-      // Owned by someone else: value is +200/min for remaining time if we can capture
-      if (send > centralGarrison) {
-        const value = 200 * timeLeftMin;
-        return value - penalty;
-      }
-      return -Infinity; // can't take now
+
+      // Endgame push: last 3 minutes → center becomes even more desirable
+      if (matchTimeLeft <= 180 && score > -Infinity) score *= 1.4;
+      return score;
     }
 
     function scoreFarm(ai, farmTarget, send) {
@@ -1298,9 +1465,10 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
 
     // --- Simple AI ---
     function aiHireAndAct(ai) {
-      // 1) Consolidate sometimes (pull back from farms)
-      if (Math.random() < 0.25) {
-        const recalled = aiRecallFromFarms(ai, 8, 2); // threshold 8, up to 2 farms
+      // 1) Consolidate sometimes (pull back from farms) — per profile
+      const prof = ai.aiProfile || { recallChance: 0.25, recallThreshold: 8, recallMaxFarms: 2 };
+      if (Math.random() < prof.recallChance) {
+        const recalled = aiRecallFromFarms(ai, prof.recallThreshold, prof.recallMaxFarms);
         if (recalled > 0) return; // wait for troops to come back this cycle
       }
 
@@ -1315,9 +1483,10 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
         ai._armyByType.militia += toBuy;
       }
 
-      // 3) Decide send fraction based on time pressure
+      // 3) Decide send fraction based on time pressure — per profile
       const urgent = (matchTimeLeft <= 120); // last 2 minutes
-      const frac = urgent ? (0.6 + Math.random() * 0.3) : (0.25 + Math.random() * 0.35);
+      const baseFrac = prof.sendFracMin + Math.random() * (prof.sendFracMax - prof.sendFracMin);
+      const frac = urgent ? Math.min(0.9, baseFrac * prof.urgentBoost) : baseFrac;
       let send = Math.max(1, Math.floor(ai.army * frac));
       if (send <= 0) return;
 
@@ -1327,10 +1496,11 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
       if (farmTarget && ai.army > farmTarget.def) {
         const need = Math.min(ai.army, Math.max(1, farmTarget.def + 1));
         const sendFarm = Math.max(1, Math.min(send, need));
-        farmDecision = { score: scoreFarm(ai, farmTarget, sendFarm), amount: sendFarm };
+        const s = scoreFarm(ai, farmTarget, sendFarm) * (prof.farmBias || 1);
+        farmDecision = { score: s, amount: sendFarm };
       }
 
-      const centerScore = scoreCenter(ai, send);
+      const centerScore = scoreCenter(ai, send) * (prof.centerAggression || 1);
 
       // Choose higher score among center and farm; if both are poor, we'll consider a raid next
       if (centerScore > farmDecision.score && centerScore > 0) {
@@ -1350,12 +1520,30 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
               const { attLeft, defLeft } = resolveBattle(p.sent, before);
               centerDefense = defLeft;
               grantCenterGuardReward(p.attackerIndex, before, centerDefense);
-              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
+              if (attLeft > 0 && defLeft === 0) {
+                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                // Award dynamic pool to the captor
+                if (centerRewardPool > 0) {
+                  const award = Math.floor(centerRewardPool);
+                  players[p.attackerIndex].gold += award;
+                  centerRewardPool = 0;
+                  updateCenterVisual();
+                }
+              }
             } else if (centralOwnerIndex === p.attackerIndex) {
               centralGarrison += p.sent;
             } else {
               const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
-              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
+              if (attLeft > 0 && defLeft === 0) {
+                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                // Award dynamic pool to the captor
+                if (centerRewardPool > 0) {
+                  const award = Math.floor(centerRewardPool);
+                  players[p.attackerIndex].gold += award;
+                  centerRewardPool = 0;
+                  updateCenterVisual();
+                }
+              }
               else { centralGarrison = defLeft; }
             }
             updateCenterVisual();
@@ -1416,9 +1604,9 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
             syncCastleGarrison(p.defenderIndex);
             if (attLeft > 0 && defLeft === 0) {
               const victim = players[p.defenderIndex];
-              const stealMax = Math.floor(victim.gold * 0.10);
-              const loot = Math.min(stealMax, 150);
-              victim.gold -= loot; players[ai.index].gold += loot;
+              const loot = calcRandomLoot(victim.gold);
+              victim.gold = Math.max(0, victim.gold - loot);
+              players[ai.index].gold += loot;
               sendBackSurvivors(p.targetX, p.targetY, p.originX, p.originY, attLeft, ai.index);
             }
           }
@@ -1443,12 +1631,30 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
               const { attLeft, defLeft } = resolveBattle(p.sent, before);
               centerDefense = defLeft;
               grantCenterGuardReward(p.attackerIndex, before, centerDefense);
-              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
+              if (attLeft > 0 && defLeft === 0) {
+                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                // Award dynamic pool to the captor
+                if (centerRewardPool > 0) {
+                  const award = Math.floor(centerRewardPool);
+                  players[p.attackerIndex].gold += award;
+                  centerRewardPool = 0;
+                  updateCenterVisual();
+                }
+              }
             } else if (centralOwnerIndex === p.attackerIndex) {
               centralGarrison += p.sent;
             } else {
               const { attLeft, defLeft } = resolveBattle(p.sent, centralGarrison);
-              if (attLeft > 0 && defLeft === 0) { centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft; }
+              if (attLeft > 0 && defLeft === 0) {
+                centralOwnerIndex = p.attackerIndex; centralGarrison = attLeft;
+                // Award dynamic pool to the captor
+                if (centerRewardPool > 0) {
+                  const award = Math.floor(centerRewardPool);
+                  players[p.attackerIndex].gold += award;
+                  centerRewardPool = 0;
+                  updateCenterVisual();
+                }
+              }
               else { centralGarrison = defLeft; }
             }
             updateCenterVisual();
@@ -1460,12 +1666,14 @@ centerElement = addObject("center", 50, 50, "Central Castle — Guard: " + cente
       //    e) Otherwise, hold — let income/auto-hire stack for a stronger push next cycle
     }
 
-    // Run AI for players 2..8 with jittered schedule (6–12s between actions)
+    // Run AI for players 2..8 with jittered schedule (per profile)
     function scheduleAI(ai) {
-      const delay = 6000 + Math.random() * 6000; // 6–12 seconds
+      const prof = ai.aiProfile || { actionDelayMin: 6000, actionDelayMax: 12000 };
+      const span = Math.max(0, (prof.actionDelayMax - prof.actionDelayMin));
+      const delay = (prof.actionDelayMin || 6000) + Math.random() * span;
       setTimeout(() => {
         aiHireAndAct(ai);
-        scheduleAI(ai); // reschedule with new jitter
+        scheduleAI(ai); // reschedule with new jitter per profile
       }, delay);
     }
     for (let i = 1; i < players.length; i++) {
